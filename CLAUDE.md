@@ -32,7 +32,11 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 `retrieve_items_for_queue()` does the whole grouping job:
 
 1. Reads `BefordringsData` from the RPA database (connection string from `RPAConnection(db_env="PROD").get_constant("DbConnectionString")`).
-2. Resolves every distinct student address to an `adresse_id` against the befordring application's **own** `Adresse` table, through `/adresse/by-tekst` and `/adresse/search`. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS itself and the whole conversion is API-only. Addresses that resolve to nothing, or ambiguously, are logged and left unresolved — `process_item` then raises a `BusinessError` for manual follow-up rather than creating a student with no address.
+2. Resolves the address **each bevilling was granted against** to an `adresse_id`, via `/adresse/by-tekst` and `/adresse/search` against the befordring application's own `Adresse` table. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS and the conversion is API-only.
+
+   Note this is *not* the student's current address — that already sits on `Elev`, put there by the nightly run, and nothing here looks it up. `Bevilling.adresse_id` records where a given bevilling was granted, which is what `adresse_mismatch` later compares against the student's own. A student who moved has older bevillinger at the previous address, so it is resolved **per bevilling**, not per case.
+
+   `Bevilling.adresse_id` is `NOT NULL`, so a bevilling whose address cannot be matched cannot be created. `process_item` rejects the whole case in that event rather than converting it partially — a case missing one of its bevillinger looks complete to a caseworker and is harder to spot than one that never arrived.
 3. Groups rows into **one queue item per PPR case**, referenced by `CaseID`, so re-running `--queue` cannot duplicate.
 4. Within a case, groups rows into **bevillinger by `(BevillingFra, BevillingTil)`**. Rows sharing a date pair are kørselsrækker of one bevilling; a different date pair is a different, often outdated, bevilling.
 
@@ -96,7 +100,7 @@ So a miss now raises `BusinessError`, which sends the item to `pending_user` rat
 
 ### Address resolution is unverified against real data
 
-`/adresse/by-tekst` is an **exact, case-sensitive** match on `"<adresse>, <postnummer>"`, and nobody has yet confirmed that `BefordringsData.ElevensAdresse` / `ElevensPostnummer` spell an address the same way `Adresse.adresse_tekst` does (which comes from LOIS `AdresseBetegnelse`, e.g. `"Grøndalsvej 1, 8260 Viby J"` — note the postal code carries a city name).
+`/adresse/by-tekst` is an **exact, case-sensitive** match on `"<adresse>, <postnummer>"`, and nobody has yet confirmed that `BefordringsData.ElevensAdresse` / `ElevensPostnummer` — the bevilling's address, despite the column names — spell an address the same way `Adresse.adresse_tekst` does (which comes from LOIS `AdresseBetegnelse`, e.g. `"Grøndalsvej 1, 8260 Viby J"` — note the postal code carries a city name).
 
 The prefix-search fallback exists to absorb that, and it is deliberately strict: a candidate is accepted only when exactly one survives filtering by postal code, because `"Grøndalsvej 1"` is also a prefix of `"Grøndalsvej 10"`. Placing a child at the wrong house is worse than failing to place them.
 

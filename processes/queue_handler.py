@@ -44,7 +44,13 @@ _KOERSELSRAEKKE_FIELDS = {
 
 
 def _address_key(row: dict) -> tuple[str, str] | None:
-    """The (street, postal) pair identifying a student's address in a row."""
+    """The (street, postal) pair identifying the address a row's bevilling is for.
+
+    Not the student's current address — that already sits on Elev, put there by
+    the nightly run, and nothing here needs to look it up. This is the address
+    the legacy bevilling was granted against, which becomes Bevilling.adresse_id
+    and is what adresse_mismatch later compares to the student's own.
+    """
 
     adresse = str(row.get("ElevensAdresse") or "").strip()
     postnummer = str(row.get("ElevensPostnummer") or "").strip()
@@ -56,7 +62,7 @@ def _address_key(row: dict) -> tuple[str, str] | None:
 
 
 def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
-    """Resolve each distinct student address to an adresse_id.
+    """Resolve each distinct bevilling address to an adresse_id.
 
     Resolved against the befordring application's own Adresse table, through
     its API. That table is a full copy of the municipality's address register,
@@ -84,7 +90,8 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
     Returns:
         dict mapping (adresse, postnummer) -> adresse_id. Addresses that
         resolve to nothing, or to more than one candidate, are omitted and
-        logged; process_item then rejects those cases for manual follow-up.
+        logged; the bevilling using them is then rejected for manual
+        follow-up, since Bevilling.adresse_id is NOT NULL.
     """
 
     api_endpoint, api_key = get_api_credentials()
@@ -154,15 +161,15 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
         )
 
     logger.info(
-        "Resolved %d/%d distinct address(es) against the befordring Adresse table.\n",
+        "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
         len(resolved),
         len(keys),
     )
 
     if unresolved:
         logger.warning(
-            "%d address(es) unresolved — the cases using them will be rejected "
-            "for manual follow-up:\n%s\n",
+            "%d address(es) unresolved — the bevillinger using them will be "
+            "rejected for manual follow-up:\n%s\n",
             len(unresolved),
             "\n".join(f"  {a}, {p}" for a, p in unresolved),
         )
@@ -179,9 +186,11 @@ def retrieve_items_for_queue() -> list[dict]:
     embedded in the payload.  The ATS reference is the PPR case ID so
     re-running the queue phase never creates duplicates.
 
-    Each student's adresse_id is resolved up front from the befordring
+    Each BEVILLING's adresse_id is resolved up front from the befordring
     application's own Adresse table (see _resolve_adresse_ids), so the whole
     conversion talks to one system rather than reaching into LOIS separately.
+    The student's own address is not resolved here at all — it is already on
+    Elev, put there by the nightly run.
     """
 
     with RPAConnection(db_env="PROD") as rpa_conn:
@@ -220,18 +229,6 @@ def retrieve_items_for_queue() -> list[dict]:
         case_rows = list(case_iter)
         person_ssn = case_rows[0].get("CPR", "")
 
-        # One case is one student, so one address. Rows can disagree — an old
-        # row may predate a move — so take the first that resolves rather than
-        # trusting row zero.
-        adresse_id = next(
-            (
-                adresse_ids[key]
-                for key in (_address_key(row) for row in case_rows)
-                if key and key in adresse_ids
-            ),
-            None,
-        )
-
         # Within each case, group rows into bevillinger by (BevillingFra, BevillingTil).
         # Rows sharing the same date pair are kørselsrækker under the same bevilling.
         # Rows with different date pairs are separate (e.g. outdated) bevillinger.
@@ -258,8 +255,25 @@ def retrieve_items_for_queue() -> list[dict]:
                 for row in bev_rows
             ]
 
+            # The address belongs to the bevilling, not the case: a student
+            # who moved has older bevillinger at the previous address, and
+            # Bevilling.adresse_id is meant to record where each one was
+            # granted. Resolved per bevilling for that reason.
+            #
+            # Rows within one bevilling can still disagree, so take the first
+            # that resolves rather than trusting row zero.
+            bevilling_adresse_id = next(
+                (
+                    adresse_ids[key]
+                    for key in (_address_key(row) for row in bev_rows)
+                    if key and key in adresse_ids
+                ),
+                None,
+            )
+
             bevillinger.append({
                 **bevilling_data,
+                "adresse_id": bevilling_adresse_id,
                 "koerselsraekker": koerselsraekker,
             })
 
@@ -268,7 +282,6 @@ def retrieve_items_for_queue() -> list[dict]:
             "data": {
                 "ppr_case_id": ppr_case_id,
                 "person_ssn": person_ssn,
-                "adresse_id": adresse_id,
                 "bevillinger": bevillinger,
             },
         })

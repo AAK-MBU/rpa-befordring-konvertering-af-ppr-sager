@@ -93,15 +93,15 @@ def create_bevilling(
     person_ssn: str,
     bor_case_id: str,
     bevillinger: list[dict],
-    adresse_id: str,
 ) -> None:
     """
     Creates bevilling and koerselsraekke records via the API for a student
     who is already in Elev.
 
-    Address creation is not handled here — adresse_id is expected to already
-    exist in the Adresse table (populated by the nightly sync). This flow
-    only ever references it.
+    Addresses are not created here. Each bevilling carries the adresse_id it
+    was granted against, resolved at queue time against the Adresse table —
+    which the nightly run keeps as a full copy of the municipality's register.
+    This flow only ever references it.
 
     Flow per call:
       1. GET  /citizen/stamdata/{cpr}           — must exist; BusinessError if not
@@ -113,8 +113,8 @@ def create_bevilling(
         person_ssn:       Citizen SSN (CPR).
         person_full_name: Citizen full name resolved from GO contact lookup.
         bor_case_id:      Resolved BOR case ID, stored as esdh_noegle.
-        bevillinger:      Grouped bevilling list from BefordringsData.
-        adresse_id:       AdresseId resolved from LOIS at queue time.
+        bevillinger:      Grouped bevilling list from BefordringsData. Each
+                          entry carries its own adresse_id.
     """
     api_endpoint, api_key = get_api_credentials()
     headers = {"X-API-Key": api_key}
@@ -246,7 +246,10 @@ def create_bevilling(
             revurderingsdato = None
 
         bevilling_payload = {
-            "adresse_id": adresse_id,
+            # Per bevilling, not per case: a student who moved has older
+            # bevillinger at the previous address. process_item has already
+            # rejected the case if any of these is missing.
+            "adresse_id": bevilling.get("adresse_id"),
             "matrikel_id": matrikel_id,
             "hjemmel_id": hjemmel_id,
             "sagsbehandler_id": sagsbehandler_id,

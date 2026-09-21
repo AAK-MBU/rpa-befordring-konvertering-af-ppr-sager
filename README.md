@@ -25,7 +25,11 @@ Faserne er uafhængige og kan kombineres.
 `retrieve_items_for_queue()` i `processes/queue_handler.py` står for hele grupperingen:
 
 1. Læser `BefordringsData` fra RPA-databasen (forbindelsen hentes fra `RPAConnection`).
-2. Slår `adresse_id` op for hver enkelt adresse i befordringsapplikationens **egen** `Adresse`-tabel via `/adresse/by-tekst` og `/adresse/search`. Den tabel er en fuld kopi af kommunens adresseregister, som `rpa-befordring-nightly-runs` opdaterer hver nat — så denne robot henter ikke længere selv fra LOIS, og hele konverteringen går gennem ét API. Adresser, der ikke kan slås entydigt op, logges, og `process_item` afviser de sager med en `BusinessError` til manuel opfølgning.
+2. Slår op, hvilken adresse **hver bevilling er givet på**, i befordringsapplikationens egen `Adresse`-tabel via `/adresse/by-tekst` og `/adresse/search`. Den tabel er en fuld kopi af kommunens adresseregister, som `rpa-befordring-nightly-runs` opdaterer hver nat — så robotten henter ikke længere selv fra LOIS, og hele konverteringen går gennem ét API.
+
+   Det er ikke elevens nuværende adresse: den ligger allerede på `Elev` fra nattekørslen. `Bevilling.adresse_id` fortæller, hvor den enkelte bevilling blev givet, og en elev, der er flyttet, har ældre bevillinger på den gamle adresse — derfor slås den op pr. bevilling og ikke pr. sag.
+
+   `Bevilling.adresse_id` er `NOT NULL`, så en bevilling uden match kan ikke oprettes. `process_item` afviser hele sagen i det tilfælde frem for at konvertere den delvist.
 3. Danner **ét kø-item pr. PPR-sag** med `CaseID` som reference, så `--queue` kan køres igen uden at skabe dubletter.
 4. Grupperer rækkerne inden for sagen til **bevillinger efter `(BevillingFra, BevillingTil)`**. Rækker med samme datopar er kørselsrækker under samme bevilling; et andet datopar er en anden — ofte forældet — bevilling.
 
