@@ -42,13 +42,78 @@ def _fetch_lookup(api_endpoint: str, api_key: str, path: str) -> list[dict]:
     return response.json()
 
 
+def _normalise(value: str | None) -> str:
+    """Reduce a lookup label to a form the two systems agree on.
+
+    Casefolded with ALL whitespace removed, because BefordringsData and the
+    befordring database do not space these consistently:
+
+        BefordringsData   "Egenbefordring"
+        Befordringstype   "Egen befordring"
+
+    Verified against the seeded lookups — Befordringstype, Tidspunkt,
+    Rutetype, KoerselstypeTillaeg, Hjemmel and Ugedag — that removing spaces
+    collapses no two values onto each other, so nothing becomes ambiguous.
+
+    This is the third place in the system to need it: view_Koerselsgodtgoerelse
+    _Modtagere strips spaces before comparing, and so does labelIsEgenbefordring
+    in the frontend. recalculateEgenbefordringRows silently never fired for
+    months because it did not.
+    """
+
+    return "".join(str(value or "").split()).casefold()
+
+
 def _build_lookup_map(items: list[dict], name_key: str, id_key: str) -> dict[str, int]:
-    """Build a case-insensitive name → id dict from a lookup list."""
+    """Build a whitespace- and case-insensitive name → id dict."""
     return {
-        item[name_key].strip().lower(): item[id_key]
+        _normalise(item[name_key]): item[id_key]
         for item in items
         if item.get(name_key)
     }
+
+
+def _build_label_map(items: list[dict], name_key: str) -> dict[str, str]:
+    """normalised key → the label as the befordring database spells it."""
+    return {
+        _normalise(item[name_key]): item[name_key]
+        for item in items
+        if item.get(name_key)
+    }
+
+
+def _resolve(
+    lookup: dict[str, int],
+    labels: dict[str, str],
+    raw: str | None,
+    what: str,
+) -> int | None:
+    """Look a value up, reporting when the two systems spell it differently.
+
+    Fuzzy matching that says nothing hides the data problem it papers over.
+    The comparison is source against the STORED label — not against the
+    normalised key — so a value the two systems already agree on stays silent
+    however many spaces it contains.
+    """
+
+    if not raw:
+        return None
+
+    key = _normalise(raw)
+    found = lookup.get(key)
+
+    if found is not None:
+        stored = labels.get(key, "")
+
+        if str(raw).strip().casefold() != stored.strip().casefold():
+            logger.info(
+                "  %s %r stored as %r — matched after normalising.",
+                what,
+                str(raw).strip(),
+                stored,
+            )
+
+    return found
 
 
 def _parse_date(value: str | None) -> str | None:
@@ -158,9 +223,15 @@ def create_bevilling(
     # All lookup endpoints return {"id": ..., "label": ...}
     tidspunkt_map = _build_lookup_map(tidspunkter, name_key="label", id_key="id")
     koerselstype_map = _build_lookup_map(koerselstyper, name_key="label", id_key="id")
+
+    # How the befordring database spells each one, for the mismatch report in
+    # _resolve. BefordringsData says "Egenbefordring" where the lookup says
+    # "Egen befordring", and that is worth seeing rather than silently fixing.
+    tidspunkt_labels = _build_label_map(tidspunkter, name_key="label")
+    koerselstype_labels = _build_label_map(koerselstyper, name_key="label")
     sagsbehandler_map = _build_lookup_map(sagsbehandlere, name_key="label", id_key="id")
 
-    sagsbehandler_id = sagsbehandler_map.get(_SAGSBEHANDLER_NAVN.strip().lower())
+    sagsbehandler_id = sagsbehandler_map.get(_normalise(_SAGSBEHANDLER_NAVN))
 
     if sagsbehandler_id is None:
         raise ProcessError(
@@ -181,7 +252,7 @@ def create_bevilling(
     missing_rutetyper = [
         navn
         for navn in _RUTETYPE_FROM_TIDSPUNKT.values()
-        if navn.lower() not in rutetype_map
+        if _normalise(navn) not in rutetype_map
     ]
 
     if missing_rutetyper:
@@ -200,7 +271,7 @@ def create_bevilling(
     # mutually exclusive with the individual days, so a caseworker narrowing it
     # later replaces it rather than adding to it.
     dag_map = _build_lookup_map(dage, name_key="label", id_key="id")
-    alle_dage_id = dag_map.get("alle")
+    alle_dage_id = dag_map.get(_normalise("Alle"))
 
     if alle_dage_id is None:
         raise ProcessError(
@@ -329,7 +400,7 @@ def create_bevilling(
 
         raw_hjemmel = (bevilling.get("HjemmelForBevilling") or "").strip()
         hjemmel_entry = _HJEMMEL_MAPPING.get(raw_hjemmel)
-        hjemmel_id = hjemmel_map.get(hjemmel_entry["db_tekst"].lower()) if hjemmel_entry else None
+        hjemmel_id = hjemmel_map.get(_normalise(hjemmel_entry["db_tekst"])) if hjemmel_entry else None
         begrundelse = hjemmel_entry["begrundelse"] if hjemmel_entry else None
 
         revurderingsdato = _parse_date(bevilling.get("Revurdering"))
@@ -404,18 +475,27 @@ def create_bevilling(
 
         # --- POST: create each koerselsraekke ---
         for j, kr in enumerate(koerselsraekker, start=1):
-            raw_tidspunkt = (kr.get("TidspunktForBevilling") or "").strip().lower()
-            raw_koerselstype = (kr.get("BevillingAfKoerselstype") or "").strip().lower()
+            raw_tidspunkt = _normalise(kr.get("TidspunktForBevilling"))
 
-            tidspunkt_id = tidspunkt_map.get(raw_tidspunkt)
-            befordringstype_id = koerselstype_map.get(raw_koerselstype)
+            tidspunkt_id = _resolve(
+                tidspunkt_map,
+                tidspunkt_labels,
+                kr.get("TidspunktForBevilling"),
+                "Tidspunkt",
+            )
+            befordringstype_id = _resolve(
+                koerselstype_map,
+                koerselstype_labels,
+                kr.get("BevillingAfKoerselstype"),
+                "Kørselstype",
+            )
 
             # Derived from the tidspunkt — see _RUTETYPE_FROM_TIDSPUNKT. Safe
             # to look up unguarded: the tidspunkt check below rejects anything
             # outside the three known values, and the startup check above
             # proved each maps to a real rutetype.
             rutetype_navn = _RUTETYPE_FROM_TIDSPUNKT.get(raw_tidspunkt)
-            rutetype_id = rutetype_map.get(rutetype_navn.lower()) if rutetype_navn else None
+            rutetype_id = rutetype_map.get(_normalise(rutetype_navn)) if rutetype_navn else None
 
             if not tidspunkt_id:
                 raise BusinessError(

@@ -153,6 +153,39 @@ right in substance, and a caseworker narrowing the days later replaces `Alle`
 rather than adding to it. Fixing it automatically would mean inventing
 weekday splits the source never recorded.
 
+### Lookup values are matched with whitespace removed
+
+The two systems do not space these consistently:
+
+```
+BefordringsData   Egenbefordring
+Befordringstype   Egen befordring
+```
+
+`_normalise()` casefolds and removes **all** whitespace before matching, rather
+than aliasing that one value. Verified against every seeded lookup —
+`Befordringstype`, `Tidspunkt`, `Rutetype`, `KoerselstypeTillaeg`, `Hjemmel`,
+`Ugedag` — that removing spaces collapses no two values onto each other, so
+nothing becomes ambiguous.
+
+This is the third place in the system to need it. `view_Koerselsgodtgoerelse_Modtagere`
+strips spaces before comparing, and so does `labelIsEgenbefordring` in the
+frontend — both because of this same discrepancy, and
+`recalculateEgenbefordringRows` silently never fired for months because it did
+not.
+
+Fuzzy matching that says nothing hides the problem it papers over, so
+`_resolve()` logs when a source value matched only after normalising, naming
+both spellings:
+
+```
+Kørselstype 'Egenbefordring' stored as 'Egen befordring' — matched after normalising.
+```
+
+The comparison is against the *stored* label, not the normalised key, so a
+value both systems already agree on stays silent however many spaces it
+contains.
+
 ### Caseworker assignment
 
 Every converted bevilling is assigned to one caseworker, `_SAGSBEHANDLER_NAVN`
