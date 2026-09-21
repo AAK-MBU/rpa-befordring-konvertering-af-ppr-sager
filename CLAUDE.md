@@ -100,22 +100,46 @@ So a miss now raises `BusinessError`, which sends the item to `pending_user` rat
 
 ### How addresses are matched
 
-The two systems do not write an address the same way:
+The two systems write the middle of an address differently, and the difference is **not one thing**:
 
 ```
-BefordringsData   Kærlundvej 16, 8260 Viby J
-Adresse           Kærlundvej 16, Ormslev, 8260 Viby J
+supplementary place name — register only
+  BefordringsData   Kærlundvej 16, 8260 Viby J
+  Adresse           Kærlundvej 16, Ormslev, 8260 Viby J
+
+floor and door — both, and load-bearing
+  BefordringsData   Langkærvej 19, st. tv, 8381 Tilst
+  Adresse           Langkærvej 19, st. tv, 8381 Tilst
+                    Langkærvej 19, st. th, 8381 Tilst    <- different flat
+                    Langkærvej 19, 1. tv, 8381 Tilst     <- different flat
 ```
 
-Same address. The register carries LOIS's `SupplBynavn` (`Ormslev`) where one exists; the legacy data does not. Note also that `ElevensAdresse` **already includes the postcode and city** — `ElevensPostnummer` is a separate column holding `8260` again, and appending it produces nonsense.
+Note also that `ElevensAdresse` **already includes the postcode and city** — `ElevensPostnummer` is a separate column holding `8381` again, and appending it produces nonsense. It is only used as a fallback when the address string has no postcode.
 
-So both sides are reduced to `(street + number, postcode)` by `_split_adresse()` — first comma-component and the four digits at the start of the last one — and everything in between is ignored. `_matches()` then compares case-insensitively on street, exactly on postcode.
+Classifying each middle part as "place name" or "floor/door" would mean encoding Danish address conventions and getting every variant right. `_matches()` sidesteps that with **subsequence matching**:
 
-Lookup is `/adresse/search` with **`"<street>,"` including the trailing comma** as the prefix. Every `adresse_tekst` has a comma straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, 8260 Viby J"` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`. Without the comma, searching for house 1 pulls in 1, 10, 11 and the rest — and that endpoint caps at 15 rows, so the wanted one can be pushed out entirely.
+- street (first part) must be equal
+- postcode (four digits of the last part) must be equal
+- every middle part of the **source** must appear among the candidate's middle parts, in order
+
+Extra parts in the candidate are therefore fine — that is the place name. Missing ones are not — that is a different flat. Everything is casefolded and whitespace-collapsed first.
+
+A source with no floor/door still matches every flat at that number, which is correct: nothing in the data says which one, so several candidates survive and the address is refused rather than guessed.
+
+`_search_prefixes()` decides what to search for, most selective first:
+
+1. `"<street>, <first middle>,"` — e.g. `"langkærvej 19, st. tv,"`
+2. `"<street>,"` — e.g. `"langkærvej 19,"`
+
+The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
+
+Including the floor matters because `/adresse/search` caps at **15 rows**. A block of flats exceeds that on the street prefix alone, and the wanted address would be pushed out of the results and look absent. The street-only prefix is kept as a fallback for the case where the register puts a place name where this assumes the floor is.
+
+Matching relies on the database collation being case-insensitive for the `LIKE` — standard for this instance, but it is a dependency.
 
 A candidate is accepted only when **exactly one** survives. Placing a bevilling at the wrong address is worse than failing to place it.
 
-Still unverified against the full dataset: the first `--queue` run logs the resolution rate and lists every unresolved address with its candidate count. Read it before trusting the conversion. A `0 candidate(s)` line means the address is absent or the street is spelled differently; `2+` means the trailing-comma trick did not disambiguate and that address needs looking at by hand.
+The first `--queue` run logs the resolution rate and lists every unresolved address with its candidate count. `0 candidate(s)` means absent or spelled differently; `2+` means genuinely ambiguous — usually a flat with no floor/door in the legacy data — and needs a human.
 
 ## Verified compatible
 

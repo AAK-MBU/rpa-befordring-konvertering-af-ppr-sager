@@ -47,63 +47,80 @@ _KOERSELSRAEKKE_FIELDS = {
 _POSTCODE = re.compile(r"^(\d{4})\b")
 
 
-def _split_adresse(tekst: str) -> tuple[str, str] | None:
-    """Split a Danish address string into (street + number, postcode).
+def _components(tekst: str | None) -> list[str]:
+    """Split an address into normalised comma-separated parts.
 
-    Both sides of the comparison are reduced to these two parts, because the
-    two systems do not write the middle the same way. The address register
-    carries LOIS's SupplBynavn where one exists; BefordringsData does not:
-
-        BefordringsData  "Kærlundvej 16, 8260 Viby J"
-        Adresse          "Kærlundvej 16, Ormslev, 8260 Viby J"
-
-    Same address. Comparing the full strings — or matching on a prefix of one
-    against the other — gets this wrong in both directions. Comparing
-    (street, postcode) gets it right and ignores everything in between.
-
-    Returns None when there is no street part to work with.
+    Whitespace runs are collapsed and everything is casefolded, so
+    "Kærlundvej  16" and "KÆRLUNDVEJ 16" compare equal.
     """
 
-    parts = [part.strip() for part in str(tekst or "").split(",") if part.strip()]
-
-    if not parts:
-        return None
-
-    # Collapse runs of whitespace so "Kærlundvej  16" matches "Kærlundvej 16".
-    street = " ".join(parts[0].split())
-
-    postcode = ""
-    if len(parts) > 1:
-        match = _POSTCODE.match(parts[-1])
-        if match:
-            postcode = match.group(1)
-
-    return street, postcode
+    return [
+        " ".join(part.split()).casefold()
+        for part in str(tekst or "").split(",")
+        if part.strip()
+    ]
 
 
-def _matches(adresse_tekst: str | None, street: str, postcode: str) -> bool:
-    """Does a candidate from the register describe this street and postcode?
+def _postcode_of(components: list[str]) -> str:
+    """The four-digit postcode from the last component, or ''."""
 
-    Case-insensitive on the street, exact on the postcode. Whatever sits
-    between them — a supplementary place name like "Ormslev" — is ignored,
-    which is the whole point of comparing parsed parts.
+    if not components:
+        return ""
+
+    match = _POSTCODE.match(components[-1])
+
+    return match.group(1) if match else ""
+
+
+def _matches(candidate_tekst: str | None, source: list[str]) -> bool:
+    """Does a register address describe the same place as the source address?
+
+    The two systems write the middle of an address differently, and the
+    difference is not one thing:
+
+        supplementary place name, only in the register
+            BefordringsData   Kærlundvej 16, 8260 Viby J
+            Adresse           Kærlundvej 16, Ormslev, 8260 Viby J
+
+        floor and door, in both — and load-bearing
+            BefordringsData   Langkærvej 19, st. tv, 8381 Tilst
+            Adresse           Langkærvej 19, st. tv, 8381 Tilst
+                              Langkærvej 19, st. th, 8381 Tilst   <- different flat
+                              Langkærvej 19, 1. tv, 8381 Tilst    <- different flat
+
+    Classifying each middle part as "place name" or "floor/door" would mean
+    parsing Danish address conventions and getting them right for every
+    variant. Subsequence matching sidesteps that: the street must be equal,
+    the postcode must be equal, and every middle part of the SOURCE must
+    appear among the candidate's middle parts in the same order.
+
+    Extra parts in the candidate are therefore fine — that is the place name
+    the legacy data never had. Missing ones are not — that is a different flat.
+
+    A source with no floor/door still matches all of them, which is correct:
+    nothing in the data says which flat, so the caller sees several candidates
+    and refuses rather than guessing.
     """
 
-    parsed = _split_adresse(adresse_tekst)
+    candidate = _components(candidate_tekst)
 
-    if parsed is None:
+    if len(candidate) < 2 or len(source) < 2:
         return False
 
-    candidate_street, candidate_postcode = parsed
+    if candidate[0] != source[0]:
+        return False
 
-    return (
-        candidate_street.casefold() == street.casefold()
-        and candidate_postcode == postcode
-    )
+    if _postcode_of(candidate) != _postcode_of(source):
+        return False
+
+    # Every middle part of the source, in order, somewhere in the candidate's.
+    remaining = iter(candidate[1:-1])
+
+    return all(part in remaining for part in source[1:-1])
 
 
-def _address_key(row: dict) -> tuple[str, str] | None:
-    """The (street, postcode) pair for the address a row's bevilling is for.
+def _address_key(row: dict) -> tuple[str, ...] | None:
+    """The normalised components of the address a row's bevilling is for.
 
     Not the student's current address — that already sits on Elev, put there
     by the nightly run, and nothing here needs to look it up. This is the
@@ -115,23 +132,50 @@ def _address_key(row: dict) -> tuple[str, str] | None:
     is only a fallback for a row whose address string is missing it.
     """
 
-    parsed = _split_adresse(row.get("ElevensAdresse"))
+    components = _components(row.get("ElevensAdresse"))
 
-    if parsed is None:
+    if not components:
         return None
 
-    street, postcode = parsed
+    if not _postcode_of(components):
+        postnummer = str(row.get("ElevensPostnummer") or "").strip()
 
-    if not postcode:
-        postcode = str(row.get("ElevensPostnummer") or "").strip()
+        if not postnummer:
+            return None
 
-    if not street or not postcode:
+        components = components + [postnummer]
+
+    if len(components) < 2:
         return None
 
-    return (street, postcode)
+    return tuple(components)
 
 
-def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
+def _search_prefixes(source: list[str]) -> list[str]:
+    """Search prefixes to try for an address, most selective first.
+
+    Every adresse_tekst has a comma straight after the house number, so
+    "Langkærvej 19," matches "Langkærvej 19, st. tv, ..." but not
+    "Langkærvej 190, ..." or "Langkærvej 19A, ...". That comma is what makes a
+    prefix search safe at all.
+
+    Where the source names a floor and door, that is included too:
+    /adresse/search returns at most 15 rows, and a block of flats can easily
+    exceed that on the street prefix alone — the wanted address would be
+    pushed out of the results and look absent. The street-only prefix is kept
+    as a fallback, because the register sometimes puts a supplementary place
+    name where this assumes the floor is.
+    """
+
+    street = source[0]
+
+    if len(source) > 2:
+        return [f"{street}, {source[1]},", f"{street},"]
+
+    return [f"{street},"]
+
+
+def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
     """Resolve each distinct bevilling address to an adresse_id.
 
     Resolved against the befordring application's own Adresse table, through
@@ -141,27 +185,17 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
     to reach into LOIS on server 29 itself, and it keeps the conversion
     API-only rather than half API, half direct database.
 
-    Each address is searched by "<street>," as a PREFIX, then the candidates
-    are compared on parsed (street, postcode).
-
-    The trailing comma is what makes the prefix safe. Every adresse_tekst has
-    one immediately after the house number, so "Kærlundvej 16," matches
-    "Kærlundvej 16, Ormslev, 8260 Viby J" but not "Kærlundvej 160, ..." or
-    "Kærlundvej 16A, ...". Without it, searching for house 1 pulls in 1, 10,
-    11 and everything else starting with those digits — and /adresse/search
-    caps at 15 rows, so the one wanted could be pushed out entirely.
-
-    Accepted only when exactly one candidate matches on (street, postcode).
-    Placing a bevilling at the wrong address is worse than failing to place it.
+    Accepted only when exactly one candidate matches. Placing a bevilling at
+    the wrong address is worse than failing to place it.
 
     Args:
         rows: BefordringsData rows.
 
     Returns:
-        dict mapping (street, postcode) -> adresse_id. Addresses that resolve
-        to nothing, or to more than one candidate, are omitted and logged; the
-        bevilling using them is then rejected for manual follow-up, since
-        Bevilling.adresse_id is NOT NULL.
+        dict mapping the address components -> adresse_id. Addresses that
+        resolve to nothing, or to more than one candidate, are omitted and
+        logged; the bevilling using them is then rejected for manual
+        follow-up, since Bevilling.adresse_id is NOT NULL.
     """
 
     api_endpoint, api_key = get_api_credentials()
@@ -169,34 +203,41 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
 
     keys = {key for key in (_address_key(row) for row in rows) if key}
 
-    resolved: dict[tuple[str, str], str] = {}
-    unresolved: list[tuple[tuple[str, str], int]] = []
+    resolved: dict[tuple[str, ...], str] = {}
+    unresolved: list[tuple[tuple[str, ...], int]] = []
 
-    for street, postcode in sorted(keys):
-        response = requests.get(
-            f"{api_endpoint}/adresse/search",
-            params={"q": f"{street},"},
-            headers=headers,
-            timeout=30,
-        )
+    for key in sorted(keys):
+        source = list(key)
+        candidates: list[dict] = []
 
-        if not response.ok:
-            raise ProcessError(
-                f"Address search failed for {street!r}: "
-                f"{response.status_code} — {response.text}"
+        for prefix in _search_prefixes(source):
+            response = requests.get(
+                f"{api_endpoint}/adresse/search",
+                params={"q": prefix},
+                headers=headers,
+                timeout=30,
             )
 
-        candidates = [
-            candidate
-            for candidate in (response.json() or [])
-            if _matches(candidate.get("adresse_tekst"), street, postcode)
-        ]
+            if not response.ok:
+                raise ProcessError(
+                    f"Address search failed for {prefix!r}: "
+                    f"{response.status_code} — {response.text}"
+                )
+
+            candidates = [
+                candidate
+                for candidate in (response.json() or [])
+                if _matches(candidate.get("adresse_tekst"), source)
+            ]
+
+            if candidates:
+                break
 
         if len(candidates) == 1:
-            resolved[(street, postcode)] = candidates[0]["adresse_id"]
+            resolved[key] = candidates[0]["adresse_id"]
             continue
 
-        unresolved.append(((street, postcode), len(candidates)))
+        unresolved.append((key, len(candidates)))
 
     logger.info(
         "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
@@ -210,8 +251,8 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
             "rejected for manual follow-up:\n%s\n",
             len(unresolved),
             "\n".join(
-                f"  {street}, {postcode} — {count} candidate(s)"
-                for (street, postcode), count in unresolved
+                f"  {', '.join(key)} — {count} candidate(s)"
+                for key, count in unresolved
             ),
         )
 
