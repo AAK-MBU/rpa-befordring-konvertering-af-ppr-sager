@@ -149,14 +149,6 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 }
 
 
-# BefordringsData has no rutetype — the new system does, and its own form
-# requires one. The legacy TidspunktForBevilling implies it well enough:
-# a morning-only bevilling runs one way, an afternoon-only one the other, and
-# a bevilling covering both runs in both directions.
-#
-# Keys are lowercased to match _build_lookup_map and the normalisation applied
-# to the source value. Values must match Rutetype.rutetype_tekst exactly —
-# note "Skole til hjem", not "Fra skole til hjem".
 # Every converted bevilling is assigned to this caseworker.
 #
 # BefordringsData has a Sagsbehandler column, but the names in it are legacy
@@ -171,10 +163,31 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 _SAGSBEHANDLER_NAVN = "Sofie"
 
 
+# BefordringsData has no rutetype — the new system does, and its own form
+# requires one. The legacy TidspunktForBevilling implies it well enough:
+# a morning-only bevilling runs one way, an afternoon-only one the other, and
+# a bevilling covering both runs in both directions.
+#
+# Written the way the Tidspunkt table spells them and normalised below, rather
+# than pre-normalised by hand. Hand-written keys broke once: "Morgen og
+# eftermiddag" keyed as "morgen og eftermiddag" stopped matching the moment
+# _normalise began removing interior spaces, and because the two single-word
+# values kept working the gap was invisible — every bevilling covering both
+# directions was created with no rutetype at all.
+#
+# Values must match Rutetype.rutetype_tekst — note "Skole til hjem", not
+# "Fra skole til hjem".
+_RUTETYPE_FROM_TIDSPUNKT_RAW: dict[str, str] = {
+    "Morgen": "Hjem til skole",
+    "Eftermiddag": "Skole til hjem",
+    "Morgen og eftermiddag": "Mellem hjem og skole",
+}
+
+
+# Keyed exactly as every other lookup is, so the two cannot drift apart.
 _RUTETYPE_FROM_TIDSPUNKT: dict[str, str] = {
-    "morgen": "Hjem til skole",
-    "eftermiddag": "Skole til hjem",
-    "morgen og eftermiddag": "Mellem hjem og skole",
+    _normalise(tidspunkt): rutetype
+    for tidspunkt, rutetype in _RUTETYPE_FROM_TIDSPUNKT_RAW.items()
 }
 
 
@@ -283,6 +296,24 @@ def create_bevilling(
             "Rutetype(r) named in _RUTETYPE_FROM_TIDSPUNKT do not exist in "
             f"the Rutetype lookup table: {', '.join(missing_rutetyper)}. "
             "Check for a renamed value."
+        )
+
+    # And the other direction. Without this, a key that stops matching leaves
+    # rutetype_id quietly unset on every række using that tidspunkt, while the
+    # others carry on working and hide it — which is exactly what happened to
+    # "Morgen og eftermiddag".
+    unmapped_tidspunkter = [
+        item["label"]
+        for item in tidspunkter
+        if item.get("label") and _normalise(item["label"]) not in _RUTETYPE_FROM_TIDSPUNKT
+    ]
+
+    if unmapped_tidspunkter:
+        raise ProcessError(
+            "Tidspunkt(er) in the lookup table have no entry in "
+            f"_RUTETYPE_FROM_TIDSPUNKT: {', '.join(unmapped_tidspunkter)}. "
+            "Every tidspunkt must imply a rutetype, or converted "
+            "kørselsrækker are left without one."
         )
 
     # "Alle" — the weekday option meaning every school day.
