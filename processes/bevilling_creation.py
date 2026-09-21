@@ -191,6 +191,58 @@ _RUTETYPE_FROM_TIDSPUNKT: dict[str, str] = {
 }
 
 
+def _split_koerselstype(
+    raw: str | None,
+    koerselstype_map: dict[str, int],
+    tillaeg_map: dict[str, int],
+) -> tuple[int | None, list[int]]:
+    """Resolve a BevillingAfKoerselstype, peeling off any trailing tillæg.
+
+    The source combines the two into one string where the new system keeps
+    them apart:
+
+        BefordringsData   "Rutekørsel fast forsæde"
+        Befordringstype   "Rutekørsel"
+        KoerselstypeTillaeg                "Fast forsæde"
+
+    A direct match is tried first, so a plain kørselstype can never be
+    mis-split. Only when that fails are known tillæg stripped from the end,
+    longest first — "Fast forsæde" and "Fast sæde" both exist, and taking the
+    shorter one first would leave "…for" stuck on the front of the type.
+
+    The loop rather than a single strip means a value naming two tillæg
+    resolves too, without anyone adding a case for it.
+
+    Returns (befordringstype_id, tillaeg_ids). The id is None when nothing
+    matched, which the caller turns into a BusinessError.
+    """
+
+    key = _normalise(raw)
+
+    if not key:
+        return None, []
+
+    tillaeg_ids: list[int] = []
+
+    # Longest first: see the docstring.
+    by_length = sorted(tillaeg_map, key=len, reverse=True)
+
+    while True:
+        found = koerselstype_map.get(key)
+
+        if found is not None:
+            return found, tillaeg_ids
+
+        for tillaeg_key in by_length:
+            if key.endswith(tillaeg_key) and len(key) > len(tillaeg_key):
+                key = key[: -len(tillaeg_key)]
+                tillaeg_ids.append(tillaeg_map[tillaeg_key])
+                break
+        else:
+            # Nothing left to peel and still no match.
+            return None, []
+
+
 def _has_koerselsraekker(api_endpoint: str, headers: dict, bevilling_id: int) -> bool:
     """Does this bevilling already have its kørselsrækker?
 
@@ -255,6 +307,7 @@ def create_bevilling(
     skolematrikler = _fetch_lookup(api_endpoint, api_key, "/lookup/skolematrikel")
     dage = _fetch_lookup(api_endpoint, api_key, "/lookup/dage")
     rutetyper = _fetch_lookup(api_endpoint, api_key, "/lookup/rutetyper")
+    koerselstype_tillaeg = _fetch_lookup(api_endpoint, api_key, "/lookup/koerselstype_tillaeg")
 
     # All lookup endpoints return {"id": ..., "label": ...}
     tidspunkt_map = _build_lookup_map(tidspunkter, name_key="label", id_key="id")
@@ -280,6 +333,11 @@ def create_bevilling(
     hjemmel_map = _build_lookup_map(hjemler, name_key="label", id_key="id")
 
     rutetype_map = _build_lookup_map(rutetyper, name_key="label", id_key="id")
+
+    # "Rutekørsel fast forsæde" is one string in the source and two things
+    # here — see _split_koerselstype.
+    tillaeg_map = _build_lookup_map(koerselstype_tillaeg, name_key="label", id_key="id")
+    tillaeg_labels = _build_label_map(koerselstype_tillaeg, name_key="label")
 
     # Fail at startup, not per row: every tidspunkt that survives the check in
     # the kørselsrække loop is one of these three, so a target that no longer
@@ -511,12 +569,34 @@ def create_bevilling(
                 kr.get("TidspunktForBevilling"),
                 "Tidspunkt",
             )
+            raw_koerselstype = kr.get("BevillingAfKoerselstype")
+
             befordringstype_id = _resolve(
                 koerselstype_map,
                 koerselstype_labels,
-                kr.get("BevillingAfKoerselstype"),
+                raw_koerselstype,
                 "Kørselstype",
             )
+
+            tillaeg_ids: list[int] = []
+
+            if befordringstype_id is None:
+                # Not a plain kørselstype — try it as a kørselstype plus one
+                # or more tillæg run together.
+                befordringstype_id, tillaeg_ids = _split_koerselstype(
+                    raw_koerselstype, koerselstype_map, tillaeg_map
+                )
+
+                if befordringstype_id is not None:
+                    logger.info(
+                        "  Kørselstype %r split into a type plus tillæg: %s",
+                        str(raw_koerselstype).strip(),
+                        ", ".join(
+                            tillaeg_labels.get(k, str(v))
+                            for k, v in tillaeg_map.items()
+                            if v in tillaeg_ids
+                        ),
+                    )
 
             if not tidspunkt_id:
                 raise BusinessError(
@@ -546,6 +626,7 @@ def create_bevilling(
                 "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
                 "kommentar": kr.get("Kommentar") or None,
                 "dag_ids": [alle_dage_id],
+                "tillaeg_ids": tillaeg_ids,
             }
 
             koersel_payload = {k: v for k, v in koersel_payload.items() if v is not None}

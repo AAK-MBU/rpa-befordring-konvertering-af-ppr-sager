@@ -197,6 +197,30 @@ The comparison is against the *stored* label, not the normalised key, so a
 value both systems already agree on stays silent however many spaces it
 contains.
 
+### Kørselstype and tillæg arrive as one string
+
+`BevillingAfKoerselstype` sometimes combines a kørselstype with a tillæg, where
+the new system keeps them apart:
+
+```
+BefordringsData       Rutekørsel fast forsæde
+Befordringstype       Rutekørsel
+KoerselstypeTillaeg              Fast forsæde
+```
+
+`_split_koerselstype()` tries a direct match first, so a plain kørselstype can
+never be mis-split. Only when that fails does it peel known tillæg off the
+end, **longest first** — `Fast forsæde` and `Fast sæde` both exist, and taking
+the shorter one first would leave `…for` stuck on the front of the type.
+
+It loops rather than stripping once, so a value naming two tillæg resolves
+without anyone adding a case for it. Anything that still will not resolve
+after peeling raises `BusinessError`, exactly as an unknown kørselstype
+always did.
+
+A split is logged, naming what came out of it, since the source string no
+longer appears anywhere in the result.
+
 ### Caseworker assignment
 
 Every converted bevilling is assigned to one caseworker, `_SAGSBEHANDLER_NAVN`
