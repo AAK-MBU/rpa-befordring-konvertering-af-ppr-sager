@@ -3,15 +3,16 @@
 import asyncio
 import json
 import logging
-import os
 from itertools import groupby
 
 import pyodbc
+import requests
 from automation_server_client import Workqueue
 from mbu_rpa_core.database.connection import RPAConnection
 from mbu_rpa_core.exceptions import ProcessError
 
 from helpers import config
+from processes.bevilling_creation import get_api_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -42,54 +43,131 @@ _KOERSELSRAEKKE_FIELDS = {
 }
 
 
-def _fetch_addresses_for_cprs(cprs: list[str]) -> dict[str, str]:
-    """
-    Batch-resolve AdresseId for a list of CPRs from [LOIS].[CPR].[PersonGeoView],
-    using a single ``IN (...)`` query.
+def _address_key(row: dict) -> tuple[str, str] | None:
+    """The (street, postal) pair identifying a student's address in a row."""
+
+    adresse = str(row.get("ElevensAdresse") or "").strip()
+    postnummer = str(row.get("ElevensPostnummer") or "").strip()
+
+    if not adresse or not postnummer:
+        return None
+
+    return (adresse, postnummer)
+
+
+def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
+    """Resolve each distinct student address to an adresse_id.
+
+    Resolved against the befordring application's own Adresse table, through
+    its API. That table is a full copy of the municipality's address register,
+    refreshed nightly by rpa-befordring-nightly-runs from
+    LOIS.DAR.AdresseDkGeoView — so there is no longer any reason for this bot
+    to reach into LOIS on server 29 itself, and it keeps the conversion
+    API-only rather than half API, half direct database.
+
+    Two attempts per address, because BefordringsData and the address register
+    do not necessarily spell an address the same way:
+
+      1. Exact match on "<adresse>, <postnummer>" via /adresse/by-tekst.
+         GET /adresse/by-tekst is case-sensitive and exact, so this only hits
+         when the two systems agree character for character.
+
+      2. Prefix search on the street part via /adresse/search, keeping only
+         candidates whose text also contains the postal code. Accepted ONLY
+         when exactly one candidate survives — "Grøndalsvej 1" is a prefix of
+         "Grøndalsvej 10" and "Grøndalsvej 11" too, and putting a child at the
+         wrong house is worse than failing to place them at all.
 
     Args:
-        cprs: List of CPR numbers (PNR_0) to resolve. Duplicates are fine.
+        rows: BefordringsData rows.
 
     Returns:
-        dict mapping CPR -> adresse_id (str). CPRs missing from PersonGeoView
-        are omitted from the result.
+        dict mapping (adresse, postnummer) -> adresse_id. Addresses that
+        resolve to nothing, or to more than one candidate, are omitted and
+        logged; process_item then rejects those cases for manual follow-up.
     """
-    if not cprs:
-        return {}
 
-    unique_cprs = list(set(cprs))
+    api_endpoint, api_key = get_api_credentials()
+    headers = {"X-API-Key": api_key}
 
-    lois_conn_string = os.getenv("DBCONNECTIONSTRINGSERVER29", "")
-    if not lois_conn_string:
-        raise ProcessError("DBCONNECTIONSTRINGSERVER29 must be set in the environment / .env file.")
+    keys = {key for key in (_address_key(row) for row in rows) if key}
 
-    with pyodbc.connect(lois_conn_string) as conn:
-        cursor = conn.cursor()
+    resolved: dict[tuple[str, str], str] = {}
+    unresolved: list[tuple[str, str]] = []
 
-        placeholders = ", ".join("?" for _ in unique_cprs)
-        cursor.execute(
-            f"""
-            SELECT [PNR_0], [AdresseId]
-            FROM [LOIS].[CPR].[PersonGeoView]
-            WHERE PNR_0 IN ({placeholders})
-            """,
-            unique_cprs,
+    for adresse, postnummer in sorted(keys):
+        full_text = f"{adresse}, {postnummer}"
+
+        exact = requests.get(
+            f"{api_endpoint}/adresse/by-tekst",
+            params={"tekst": full_text},
+            headers=headers,
+            timeout=30,
         )
-        cpr_to_adresse_id = {
-            pnr: str(adresse_id)
-            for pnr, adresse_id in cursor.fetchall()
-            if adresse_id is not None
-        }
 
-    missing_cprs = set(unique_cprs) - set(cpr_to_adresse_id)
-    if missing_cprs:
+        if not exact.ok:
+            raise ProcessError(
+                f"Address lookup failed for {full_text!r}: "
+                f"{exact.status_code} — {exact.text}"
+            )
+
+        match = exact.json()
+
+        if match:
+            resolved[(adresse, postnummer)] = match["adresse_id"]
+            continue
+
+        # Fall back to a prefix search on the street part.
+        search = requests.get(
+            f"{api_endpoint}/adresse/search",
+            params={"q": adresse},
+            headers=headers,
+            timeout=30,
+        )
+
+        if not search.ok:
+            raise ProcessError(
+                f"Address search failed for {adresse!r}: "
+                f"{search.status_code} — {search.text}"
+            )
+
+        candidates = [
+            candidate
+            for candidate in (search.json() or [])
+            if postnummer in (candidate.get("adresse_tekst") or "")
+        ]
+
+        if len(candidates) == 1:
+            resolved[(adresse, postnummer)] = candidates[0]["adresse_id"]
+            logger.info(
+                "Address %r matched by prefix search to %r",
+                full_text,
+                candidates[0]["adresse_tekst"],
+            )
+            continue
+
+        unresolved.append((adresse, postnummer))
         logger.warning(
-            "No AdresseId found in PersonGeoView for %d CPR(s): %s\n",
-            len(missing_cprs),
-            sorted(missing_cprs),
+            "Could not resolve address %r — %d candidate(s) from prefix search",
+            full_text,
+            len(candidates),
         )
 
-    return cpr_to_adresse_id
+    logger.info(
+        "Resolved %d/%d distinct address(es) against the befordring Adresse table.\n",
+        len(resolved),
+        len(keys),
+    )
+
+    if unresolved:
+        logger.warning(
+            "%d address(es) unresolved — the cases using them will be rejected "
+            "for manual follow-up:\n%s\n",
+            len(unresolved),
+            "\n".join(f"  {a}, {p}" for a, p in unresolved),
+        )
+
+    return resolved
 
 
 def retrieve_items_for_queue() -> list[dict]:
@@ -100,6 +178,10 @@ def retrieve_items_for_queue() -> list[dict]:
     One queue item per PPR case — all bevilling rows for that case are
     embedded in the payload.  The ATS reference is the PPR case ID so
     re-running the queue phase never creates duplicates.
+
+    Each student's adresse_id is resolved up front from the befordring
+    application's own Adresse table (see _resolve_adresse_ids), so the whole
+    conversion talks to one system rather than reaching into LOIS separately.
     """
 
     with RPAConnection(db_env="PROD") as rpa_conn:
@@ -129,20 +211,26 @@ def retrieve_items_for_queue() -> list[dict]:
 
     logger.info("Fetched %d row(s) from BefordringsData.\n", len(rows))
 
-    # --- Resolve adresse_id for every distinct student up front ---
-    unique_cprs = list({r.get("CPR", "") for r in rows if r.get("CPR")})
-    cpr_to_adresse_id = _fetch_addresses_for_cprs(unique_cprs)
-    logger.info(
-        "Resolved adresse_id for %d/%d student(s) via LOIS.\n",
-        len(cpr_to_adresse_id),
-        len(unique_cprs),
-    )
+    # --- Resolve every distinct address up front ---
+    adresse_ids = _resolve_adresse_ids(rows)
 
     items = []
 
     for ppr_case_id, case_iter in groupby(rows, key=lambda r: r["CaseID"]):
         case_rows = list(case_iter)
         person_ssn = case_rows[0].get("CPR", "")
+
+        # One case is one student, so one address. Rows can disagree — an old
+        # row may predate a move — so take the first that resolves rather than
+        # trusting row zero.
+        adresse_id = next(
+            (
+                adresse_ids[key]
+                for key in (_address_key(row) for row in case_rows)
+                if key and key in adresse_ids
+            ),
+            None,
+        )
 
         # Within each case, group rows into bevillinger by (BevillingFra, BevillingTil).
         # Rows sharing the same date pair are kørselsrækker under the same bevilling.
@@ -180,7 +268,7 @@ def retrieve_items_for_queue() -> list[dict]:
             "data": {
                 "ppr_case_id": ppr_case_id,
                 "person_ssn": person_ssn,
-                "adresse_id": cpr_to_adresse_id.get(person_ssn),
+                "adresse_id": adresse_id,
                 "bevillinger": bevillinger,
             },
         })

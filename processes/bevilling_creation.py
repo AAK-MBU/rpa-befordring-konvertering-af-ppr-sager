@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # API client helpers
 # ---------------------------------------------------------------------------
 
-def _get_api_credentials() -> tuple[str, str]:
+def get_api_credentials() -> tuple[str, str]:
     """Read befordring API endpoint and key from environment variables."""
     api_endpoint = os.getenv("API_ENDPOINT", "")
     api_key = os.getenv("API_KEY", "")
@@ -96,16 +96,15 @@ def create_bevilling(
     adresse_id: str,
 ) -> None:
     """
-    Ensures the student exists in the befordring app, then creates bevilling
-    and koerselsraekke records via the API.
+    Creates bevilling and koerselsraekke records via the API for a student
+    who is already in Elev.
 
     Address creation is not handled here — adresse_id is expected to already
     exist in the Adresse table (populated by the nightly sync). This flow
     only ever references it.
 
     Flow per call:
-      1. GET  /citizen/stamdata/{cpr}           — check existence
-         POST /citizen/create_elev              — create if missing (cpr + adresse_id only)
+      1. GET  /citizen/stamdata/{cpr}           — must exist; BusinessError if not
       2. POST /bevilling/create_bevilling/{cpr} — once per bevilling
       3. POST /bevilling/create_koerselsraekke  — once per koerselsraekke
 
@@ -117,7 +116,7 @@ def create_bevilling(
         bevillinger:      Grouped bevilling list from BefordringsData.
         adresse_id:       AdresseId resolved from LOIS at queue time.
     """
-    api_endpoint, api_key = _get_api_credentials()
+    api_endpoint, api_key = get_api_credentials()
     headers = {"X-API-Key": api_key}
 
     # --- Fetch lookup tables once and build resolution maps ---
@@ -157,28 +156,33 @@ def create_bevilling(
         )
 
     if stamdata_response.json() is None:
-        logger.info("Student %s not found — creating Elev record.\n", person_ssn)
-
-        elev_payload = {
-            "cpr": person_ssn,
-            "adresse_id": adresse_id,
-        }
-
-        create_elev_response = requests.post(
-            f"{api_endpoint}/citizen/create_elev",
-            json=elev_payload,
-            headers=headers,
-            timeout=30,
+        # Every currently enrolled student is already in Elev: the nightly run
+        # (rpa-befordring-nightly-runs) upserts the whole student dump from
+        # Elev_STG before this conversion ever runs. A miss therefore means the
+        # nightly load does not know this person — they have most likely left
+        # the municipality or finished school since the legacy bevilling was
+        # written.
+        #
+        # This used to POST /citizen/create_elev with just {cpr, adresse_id}.
+        # That produced a row with no name, no skolekode and no klassetrin,
+        # which nothing would ever fill in — the nightly upsert only touches
+        # CPRs present in Elev_STG, and this one is not. It would also stay
+        # outside the school derivation for good, because
+        # usp_sync_elev_matrikel_from_bevilling requires a non-zero skolekode
+        # before it will take a matrikel from the bevilling. No school means no
+        # walking distance either.
+        #
+        # BusinessError rather than ProcessError: the item goes to
+        # pending_user, so the case is parked for a human rather than failed
+        # and retried. Nothing here can resolve it.
+        raise BusinessError(
+            f"Student {person_ssn} (PPR case {ppr_case_id}) is not in Elev. "
+            "The nightly student load does not know this CPR — they may have "
+            "left the municipality or finished school. Needs manual review "
+            "before the bevilling can be converted."
         )
-        if not create_elev_response.ok:
-            raise ProcessError(
-                f"Failed to create Elev for {person_ssn}: "
-                f"{create_elev_response.status_code} — {create_elev_response.text}"
-            )
-        logger.info("Created Elev for %s.\n", person_ssn)
 
-    else:
-        logger.info("Student %s already exists — skipping Elev creation.\n", person_ssn)
+    logger.info("Student %s exists in Elev.\n", person_ssn)
 
     # --- Fetch existing bevillinger for this student to avoid duplicates ---
     # If a bevilling with the same esdh_noegle (BOR case ID) already exists
@@ -249,7 +253,12 @@ def create_bevilling(
             "esdh_noegle": bor_case_id,
             "revurderingsdato": revurderingsdato,
             "begrundelse_fra_formular": begrundelse,
-            "ansoegningstype": "Kørsel",
+            # "Kørsel" until migration 009 in the befordring repo renamed it
+            # and split it into "Fast kørsel" / "Midlertidig kørsel". The API
+            # field is a free string, so the old value wrote fine and simply
+            # rendered blank in the dropdown. Legacy PPR bevillinger are all
+            # standing arrangements, so "Fast kørsel" is the right half.
+            "ansoegningstype": "Fast kørsel",
             "ansoegningsdato": _parse_date(bevilling.get("CreationDate")),
         }
 

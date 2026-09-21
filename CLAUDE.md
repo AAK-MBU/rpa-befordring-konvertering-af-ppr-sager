@@ -2,94 +2,112 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Purpose
+
+One-off migration bot. It reads the legacy befordring data held in `[RPA].[rpa].[BefordringsData]` and recreates it as bevillinger and kørselsrækker in *Befordringssystemet*, the new application, through that application's REST API. It runs at go-live, not on a schedule.
+
+Based on [odense-rpa/process-template](https://github.com/odense-rpa/process-template), which is why `application_handler` carries a GUI lifecycle with empty bodies — there is no GUI to drive.
+
+An earlier version also journalized PPR documents into GetOrganized. That was removed (`79fd8fb`), along with `helpers/case_handler.py` and `helpers/document_handler.py`. Nothing here talks to GetOrganized any more.
+
 ## Commands
 
 ```bash
-# Install dependencies (uses uv)
 uv sync
 
-# Run linting
 uv run ruff check .
 uv run ruff format .
 
-# Run the process phases (requires environment variables set)
-python main.py --queue      # populate workqueue from source data
-python main.py --process    # process items from workqueue
-python main.py --finalize   # run finalization logic
+python main.py --queue      # read BefordringsData, group, populate workqueue
+python main.py --process    # create bevillinger via the befordring API
+python main.py --finalize   # stub
 ```
+
+CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that does not raise `version` in `pyproject.toml`.
 
 ## Architecture
 
-This is a Danish municipal RPA (Robotic Process Automation) bot that converts/migrates PPR (Pædagogisk Psykologisk Rådgivning) cases into GetOrganized (GO), the municipality's case management system.
+### `--queue` — `processes/queue_handler.py`
 
-### Execution flow
+`retrieve_items_for_queue()` does the whole grouping job:
 
-`main.py` is the entry point with three independently invocable phases controlled by CLI flags:
+1. Reads `BefordringsData` from the RPA database (connection string from `RPAConnection(db_env="PROD").get_constant("DbConnectionString")`).
+2. Resolves every distinct student address to an `adresse_id` against the befordring application's **own** `Adresse` table, through `/adresse/by-tekst` and `/adresse/search`. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS itself and the whole conversion is API-only. Addresses that resolve to nothing, or ambiguously, are logged and left unresolved — `process_item` then raises a `BusinessError` for manual follow-up rather than creating a student with no address.
+3. Groups rows into **one queue item per PPR case**, referenced by `CaseID`, so re-running `--queue` cannot duplicate.
+4. Within a case, groups rows into **bevillinger by `(BevillingFra, BevillingTil)`**. Rows sharing a date pair are kørselsrækker of one bevilling; a different date pair is a different, often outdated, bevilling.
 
-1. **`--queue`** — `populate_queue()` fetches items from source systems via `RPAConnection` (RPA database), builds a list of work items, deduplicates against existing queue entries, then calls `concurrent_add()` with async concurrency + exponential-backoff retries.
+`_KOERSELSRAEKKE_FIELDS` is the dividing line: those six columns vary per kørselsrække, everything else is bevilling-level and taken as the first non-NULL value across the group — nullable columns like `Revurdering` are often NULL on early rows and populated on a later one.
 
-2. **`--process`** — `process_workqueue()` iterates the ATS workqueue. Each item calls `process_item()`. Errors are bifurcated: `BusinessError` → `item.pending_user()` (no mail), `ProcessError` → `item.fail()` + email alert. After `MAX_RETRY` consecutive failures the loop aborts. Application is reset between failures.
+### `--process` — `processes/process_item.py` → `processes/bevilling_creation.py`
 
-3. **`--finalize`** — `finalize_process()` runs post-processing cleanup.
+`process_item()` validates the payload and delegates. `create_bevilling()` does the API work:
 
-### Key modules
+1. Fetches five lookup lists once (`tidspunkter`, `koerselstyper`, `hjemler`, `sagsbehandlere`, `skolematrikel`) and builds case-insensitive name → id maps.
+2. `GET /citizen/stamdata/{cpr}`. The student **must** already exist — a miss raises `BusinessError` and parks the case for review.
+3. `GET /bevilling/get_student_bevillinger/{cpr}` to collect existing `esdh_noegle` values for de-duplication.
+4. Per bevilling: `POST /bevilling/create_bevilling/{cpr}`.
+5. Per kørselsrække: `POST /bevilling/create_koerselsraekke/{bevilling_id}`.
 
-| Module | Purpose |
+Every call authenticates with `X-API-Key` from `API_KEY`.
+
+### Mapping decisions worth knowing
+
+| Source | Target | How |
+|---|---|---|
+| `SkoleID` | `matrikel_id` | `/lookup/skolematrikel` returns `skolekode` specifically so this bot can build the map without a second query |
+| `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING`, a hardcoded dict of the three values the legacy data actually contains |
+| `Revurdering` | `revurderingsdato` | a **past** date is nulled out, so a converted bevilling is not immediately flagged for re-review |
+| `CaseID` | `esdh_noegle` | the PPR case id, also the de-duplication key |
+
+## Environment variables (`.env`)
+
+| Variable | Purpose |
 |---|---|
-| `helpers/config.py` | Central constants (`MAX_RETRY`, concurrency/retry settings) |
-| `helpers/ats_functions.py` | ATS workqueue inspection via REST API, logger init |
-| `helpers/case_handler.py` | `CaseHandler` — wraps `mbu_dev_shared_components` to create/search cases and folders in GetOrganized |
-| `helpers/document_handler.py` | `DocumentHandler` — uploads, journalizes, and finalizes documents in GetOrganized |
-| `helpers/journalize_process.py` | High-level orchestration functions for the full journalization flow (contact lookup → case folder → case → document upload → journalize/finalize) |
-| `helpers/helper_functions.py` | Utility functions |
-| `processes/queue_handler.py` | `retrieve_items_for_queue()` builds item list; `concurrent_add()` populates ATS workqueue |
-| `processes/process_item.py` | Single-item processing logic (stub — implement here) |
-| `processes/application_handler.py` | App lifecycle: `startup()`, `close()`, `reset()` |
-| `processes/error_handling.py` | `ErrorContext` + `handle_error()` — uniform error dispatch |
-| `processes/finalize_process.py` | Post-processing finalization |
+| `ATS_URL`, `ATS_TOKEN` | Automation Server workqueue |
+| `ATS_WORKQUEUE_OVERRIDE` | Override the workqueue id (dev/test) |
+| `API_ENDPOINT` | Base URL of the befordring API |
+| `API_KEY` | Sent as `X-API-Key`. Must match a hash in the target environment's `API_KEY_HASHES` — see that repo's `.env.example` |
 
-### GetOrganized (GO) integration layer
+The RPA database connection string is **not** an env var; it is fetched at runtime from `RPAConnection`.
 
-All GO API calls go through two thin wrapper classes defined in `helpers/`:
+## Known issues
 
-- **`CaseHandler`** (`helpers/case_handler.py`) — delegates to `mbu_dev_shared_components.getorganized`
-- **`DocumentHandler`** (`helpers/document_handler.py`) — delegates to `mbu_dev_shared_components.getorganized`
+Ordered by how much they matter at go-live.
 
-Both use NTLM authentication (handled transparently by `mbu_dev_shared_components.getorganized.auth`).
+1. **The de-duplication check cannot resume a partial run.** `existing_esdh_noegler` is fetched once, before the loop, and every bevilling in a case shares the same `esdh_noegle` (the PPR case id). So if a case has three bevillinger and the run dies after the first, the retry sees that `esdh_noegle` already present and skips **all three** — including the two never created. Within a single clean run it behaves correctly, because the set is not refreshed mid-loop.
 
-The underlying `mbu_dev_shared_components.getorganized` modules (installed in `.venv`):
+2. **`groupby` is applied to unsorted rows.** `itertools.groupby` only groups *consecutive* equal keys. The query sorts by `CaseID` alone, so within a case the rows are in arbitrary order — a case whose rows run date-pair A, B, A yields three bevillinger instead of two. Sort each case's rows by `(BevillingFra, BevillingTil)` before the inner `groupby`.
 
-| Module | Key functions |
-|---|---|
-| `api` | `health_check()` — GET `/_api/web`, returns bool |
-| `cases` | `get_case_metadata()`, `find_case_by_case_properties()`, `create_case_folder()`, `create_case()` |
-| `contacts` | `contact_lookup(person_ssn)` — POST to `/_goapi/contacts/readitem`, returns `{FullName, ID}` |
-| `documents` | `upload_file_to_case()`, `mark_file_as_case_record()`, `finalize_file()`, `search_documents()`, `modern_search()` |
-| `objects` | `CaseDataJson` — builds metadata XML + JSON payloads; `DocumentJsonCreator` — builds document upload payloads; `CaseTypePrefix` literal (`"BOR"`, `"PPR"`, `"EMN"`, …) |
+3. **`TOP (10)`** is still in the query, marked as test mode. A real conversion would import ten cases.
 
-**Case metadata XML format**: fields are `ows_*` attributes on a `<z:row xmlns:z="#RowsetSchema" .../>` element. Special fields: `ows_CCMContactData` (`"FullName;#GoId;#SSN;#;#"`), `ows_CCMParentCase` (`"CaseFolderId;#Prefix"`), `ows_Sagsprofil_{Prefix}` (`"ProfileId;#ProfileName"`).
+4. **Kørselsrækker are created without `dag_ids` or `rutetype_id`.** Both are optional server-side so the write succeeds, but the application's own form requires them — the first caseworker to edit a converted kørselsrække cannot save it until they fill in weekdays and rutetype.
 
-**Standard GO API endpoints used**:
-- `/_goapi/Cases` — create case or case folder (POST)
-- `/_goapi/cases/findbycaseproperties` — search cases (POST)
-- `/_goapi/contacts/readitem` — contact lookup by SSN (POST)
-- `/_goapi/Documents/AddToCase` — upload document (POST)
-- `/_goapi/Documents/MarkMultipleAsCaseRecord/ByDocumentId` — journalize (POST)
-- `/_goapi/Documents/FinalizeMultiple/ByDocumentId` — finalize (POST)
-- `/_goapi/Search/Results` — keyword document search (POST)
-- `/_api/web` — health check (GET)
+5. **`main.py` still carries the SSL-bypass block** under the `🔥 REMOVE BEFORE DEPLOYMENT` banner. It is currently commented out; delete it rather than leave it to be uncommented by accident.
 
-### External systems
+6. `process_item()` keeps a vestigial `bor_case_id = ppr_case_id` and a docstring describing a "Step 1: GO conversion" that no longer exists.
 
-- **ATS (Automation Server)** — workqueue backend; credentials via env vars `ATS_URL` and `ATS_TOKEN`
-- **GetOrganized (GO)** — SharePoint-based case management; credentials fetched from RPA database at runtime via `RPAConnection`
-- **OS2Forms** — digital forms platform; API key fetched from RPA database
-- **RPA database** — central credential/constant store accessed via `RPAConnection(db_env="PROD")`
+### Students are never created here
 
-### Error handling pattern
+Every currently enrolled student is already in `Elev`: `rpa-befordring-nightly-runs` upserts the whole dump from `Elev_STG` long before this conversion runs. A CPR that is missing is therefore one the nightly load does not know — they have most likely left the municipality or finished school since the legacy bevilling was written.
 
-`BusinessError` (expected, user-actionable) vs `ProcessError` (system failure requiring robot restart and email notification). Both are from `mbu_rpa_core.exceptions`.
+This bot used to `POST /citizen/create_elev` with just `{cpr, adresse_id}`. That produced a row with no name, no `skolekode` and no `elevklassetrin`, which nothing would ever fill in: the nightly upsert only touches CPRs present in `Elev_STG`, and this one is not. It would also sit outside the school derivation permanently, because `usp_sync_elev_matrikel_from_bevilling` requires a non-zero `skolekode` before it will take a matrikel from the bevilling — and no school means no walking distance either.
 
-### Important note
+So a miss now raises `BusinessError`, which sends the item to `pending_user` rather than failing it. Nothing the bot can do resolves it; a person has to decide whether that student should be converted at all.
 
-`main.py` contains a temporary SSL verification bypass block marked with `🔥 REMOVE BEFORE DEPLOYMENT`. This disables certificate verification for all `requests` calls and must be removed before deploying to production.
+### Address resolution is unverified against real data
+
+`/adresse/by-tekst` is an **exact, case-sensitive** match on `"<adresse>, <postnummer>"`, and nobody has yet confirmed that `BefordringsData.ElevensAdresse` / `ElevensPostnummer` spell an address the same way `Adresse.adresse_tekst` does (which comes from LOIS `AdresseBetegnelse`, e.g. `"Grøndalsvej 1, 8260 Viby J"` — note the postal code carries a city name).
+
+The prefix-search fallback exists to absorb that, and it is deliberately strict: a candidate is accepted only when exactly one survives filtering by postal code, because `"Grøndalsvej 1"` is also a prefix of `"Grøndalsvej 10"`. Placing a child at the wrong house is worse than failing to place them.
+
+The first `--queue` run logs the resolution rate and lists every unresolved address. Read that before trusting the conversion — a low rate means the two systems format addresses differently, and the fix is normalisation in `_resolve_adresse_ids`, not a larger fallback.
+
+## Verified compatible
+
+Checked against the befordring backend as of migration 022. These are fine and need no change:
+
+- `ansoegningstype` now sends `"Fast kørsel"` (was `"Kørsel"`, retired by migration 009). Legacy PPR bevillinger are all standing arrangements, so that is the correct half of the split.
+- `KoerselsraekkeCreateRequest` requires only `gyldig_fra`, `gyldig_til`, `tidspunkt_id`, `befordringstype_id`; all four are sent.
+- `begrundelse_fra_formular` became nullable in migration 017. Before that, a bevilling whose hjemmel was not in `_HJEMMEL_MAPPING` would have been rejected, because the bot strips `None` from the payload.
+- Both hjemmel targets — `§ 26, stk. 1 afstand` and `§ 26, stk. 2 sygdom` — exist verbatim in `seed_lookup_data.sql`.
+- The `sfo` → `institution` rename (migration 013) does not affect this bot: it sends neither field.
