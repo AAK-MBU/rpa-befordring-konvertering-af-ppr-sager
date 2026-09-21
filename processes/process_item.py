@@ -60,6 +60,5 @@ def process_item(item_data: dict, item_reference: str):
     bevilling_creation.create_bevilling(
         ppr_case_id=ppr_case_id,
         person_ssn=person_ssn,
-        bor_case_id=ppr_case_id,
         bevillinger=bevillinger,
     )

@@ -38,7 +38,7 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 
    `Bevilling.adresse_id` is `NOT NULL`, so a bevilling whose address cannot be matched cannot be created. `process_item` rejects the whole case in that event rather than converting it partially — a case missing one of its bevillinger looks complete to a caseworker and is harder to spot than one that never arrived.
 3. Groups rows into **one queue item per PPR case**, referenced by `CaseID`, so re-running `--queue` cannot duplicate.
-4. Within a case, groups rows into **bevillinger by `(BevillingFra, BevillingTil)`**. Rows sharing a date pair are kørselsrækker of one bevilling; a different date pair is a different, often outdated, bevilling.
+4. Within a case, buckets rows by **when they apply** — see `_bucket_key()`.
 
 `_KOERSELSRAEKKE_FIELDS` is the dividing line: those six columns vary per kørselsrække, everything else is bevilling-level and taken as the first non-NULL value across the group — nullable columns like `Revurdering` are often NULL on early rows and populated on a later one.
 
@@ -61,7 +61,7 @@ Every call authenticates with `X-API-Key` from `API_KEY`.
 | `SkoleID` | `matrikel_id` | `/lookup/skolematrikel` returns `skolekode` specifically so this bot can build the map without a second query |
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING`, a hardcoded dict of the three values the legacy data actually contains |
 | `Revurdering` | `revurderingsdato` | a **past** date is nulled out, so a converted bevilling is not immediately flagged for re-review |
-| `CaseID` | `esdh_noegle` | the PPR case id, also the de-duplication key |
+| `CaseID` | `esdh_noegle` | the PPR case id. The borgersag flow this bot once had was scrapped, so there is no separate ESDH case to resolve — the source case id is the reference. Also half of the de-duplication key |
 
 ## Environment variables (`.env`)
 
@@ -78,17 +78,79 @@ The RPA database connection string is **not** an env var; it is fetched at runti
 
 Ordered by how much they matter at go-live.
 
-1. **The de-duplication check cannot resume a partial run.** `existing_esdh_noegler` is fetched once, before the loop, and every bevilling in a case shares the same `esdh_noegle` (the PPR case id). So if a case has three bevillinger and the run dies after the first, the retry sees that `esdh_noegle` already present and skips **all three** — including the two never created. Within a single clean run it behaves correctly, because the set is not refreshed mid-loop.
+1. **`TOP (10)`** is still in the query, marked as test mode. A real conversion would import ten cases.
 
-2. **`groupby` is applied to unsorted rows.** `itertools.groupby` only groups *consecutive* equal keys. The query sorts by `CaseID` alone, so within a case the rows are in arbitrary order — a case whose rows run date-pair A, B, A yields three bevillinger instead of two. Sort each case's rows by `(BevillingFra, BevillingTil)` before the inner `groupby`.
+2. **Weekdays are always `Alle`.** The source records none, so every converted kørselsrække claims every school day. Correct for a standing arrangement, wrong for the cases where two kørselstyper split the week between them — those need a caseworker.
 
-3. **`TOP (10)`** is still in the query, marked as test mode. A real conversion would import ten cases.
+3. **`main.py` still carries the SSL-bypass block** under the `🔥 REMOVE BEFORE DEPLOYMENT` banner. It is currently commented out; delete it rather than leave it to be uncommented by accident.
 
-4. **Kørselsrækker are created without `dag_ids` or `rutetype_id`.** Both are optional server-side so the write succeeds, but the application's own form requires them — the first caseworker to edit a converted kørselsrække cannot save it until they fill in weekdays and rutetype.
 
-5. **`main.py` still carries the SSL-bypass block** under the `🔥 REMOVE BEFORE DEPLOYMENT` banner. It is currently commented out; delete it rather than leave it to be uncommented by accident.
+### How rows are bucketed into bevillinger
 
-6. `process_item()` keeps a vestigial `bor_case_id = ppr_case_id` and a docstring describing a "Step 1: GO conversion" that no longer exists.
+The legacy data cannot be converted one-bevilling-per-date-pair.
+`usp_recalculate_bevilling_status` fails a citizen who ends up with more than
+one **Aktiv** bevilling, and a student with two overlapping legacy rows would
+produce exactly that — the whole case lands on Fejlet. So rows are grouped by
+when they apply rather than by their exact dates:
+
+| Bucket | Rule | Result |
+|---|---|---|
+| `current` | period overlaps `[today, window_end]` | **one** bevilling — computes as Aktiv |
+| `future` | period starts after `window_end` | **one** bevilling — computes as Kommende |
+| `past` | already ended | one bevilling **per distinct period** — Udløbet, which does not collide |
+| `ukendt` | dates missing or unreadable | kept apart under the raw values, and logged |
+
+`window_end` is one month from the run date, or `config.CONVERSION_WINDOW_END` when pinned. Pinning it makes the grouping reproducible across runs, which is worth doing once a conversion date is agreed.
+
+Future rows are merged even where their periods are far apart. The legacy data is not detailed enough to split them into meaningful separate bevillinger, and only one may become Aktiv later in any case.
+
+Nothing here assigns a status — the status engine derives Aktiv / Kommende / Udløbet from the kørselsrække dates once the rows exist. The bucketing only decides which rows share a bevilling.
+
+Both grouping levels **sort before `groupby`**, which only groups consecutive equal keys. The query orders by `CaseID` alone, so the inner grouping was previously at the mercy of row order: a case whose rows ran date-pair A, B, A produced three bevillinger instead of two.
+
+### Re-running a partial conversion
+
+De-duplication keys on `(esdh_noegle, foerste_koersel_dato)`. Every bevilling converted from one case carries the same `esdh_noegle` — the PPR case id — so that alone could only answer "does this case have *any* bevilling?". A run that died after creating the first of three would, on retry, skip all three.
+
+`foerste_koersel_dato` is the earliest `BevillingFra` in the bucket, written on create and read back from `view_Student_Bevillinger` (added to that view for this purpose). Newly created bevillinger are added to the in-memory set as they go, so two buckets cannot collide within a single run.
+
+**Known limit:** two buckets in one case can still share a start date — a short bevilling and a longer one beginning on the same day, where only one has ended. Those are indistinguishable afterwards. A clean run converts both correctly; only a *resumed* run would skip the second. The queue phase logs every such case by id, and those are the ones to check by hand if the conversion is ever restarted part-way.
+
+### Fidelity: what the conversion can and cannot carry over
+
+The old system records less than the new one does. A bevilling here needs a
+rutetype, weekdays and kørselsrækker; `BefordringsData` has a date range, a
+tidspunkt, a kørselstype and a distance. Some of the gap is bridgeable, some
+is not, and the choices are:
+
+| New field | Source | How |
+|---|---|---|
+| `rutetype_id` | `TidspunktForBevilling` | derived — see below |
+| `dag_ids` | nothing | always `["Alle"]` |
+| kørselsrækker | one per source row in the bucket | a student with a morning row and an afternoon row gets two rækker on one bevilling, which is the right shape |
+
+`_RUTETYPE_FROM_TIDSPUNKT` derives the rutetype from the tidspunkt, because a
+morning-only bevilling runs one way and an afternoon-only one the other:
+
+| `TidspunktForBevilling` | `rutetype_tekst` |
+|---|---|
+| Morgen | Hjem til skole |
+| Eftermiddag | Skole til hjem |
+| Morgen og eftermiddag | Mellem hjem og skole |
+
+Those three are exactly the seeded `Tidspunkt` values, so every row maps. The
+targets are checked against the Rutetype lookup **at startup** rather than per
+row: a renamed value would otherwise leave `rutetype_id` quietly unset on
+every converted række.
+
+Where the legacy data is clean this produces a good result — one row becomes
+one kørselsrække with the right direction; a morning and an afternoon row
+become two. Where it is not — three rows because two kørselstyper run on
+different weekdays — the conversion keeps all three as separate rækker on the
+same bevilling, with `Alle` weekdays on each. That is wrong in detail but
+right in substance, and a caseworker narrowing the days later replaces `Alle`
+rather than adding to it. Fixing it automatically would mean inventing
+weekday splits the source never recorded.
 
 ### Students are never created here
 
@@ -146,7 +208,8 @@ The first `--queue` run logs the resolution rate and lists every unresolved addr
 Checked against the befordring backend as of migration 022. These are fine and need no change:
 
 - `ansoegningstype` now sends `"Fast kørsel"` (was `"Kørsel"`, retired by migration 009). Legacy PPR bevillinger are all standing arrangements, so that is the correct half of the split.
-- `KoerselsraekkeCreateRequest` requires only `gyldig_fra`, `gyldig_til`, `tidspunkt_id`, `befordringstype_id`; all four are sent.
+- `KoerselsraekkeCreateRequest` requires only `gyldig_fra`, `gyldig_til`, `tidspunkt_id`, `befordringstype_id`; all four are sent, plus `rutetype_id` and `dag_ids: ["Alle"]` — so a converted række satisfies the application's own form and can be edited without first filling gaps.
+- `foerste_koersel_dato` is accepted by `BevillingCreateRequest` and, since this change, returned by `view_Student_Bevillinger` — **that view must be redeployed** or the de-duplication silently never matches.
 - `begrundelse_fra_formular` became nullable in migration 017. Before that, a bevilling whose hjemmel was not in `_HJEMMEL_MAPPING` would have been rejected, because the bot strips `None` from the payload.
 - Both hjemmel targets — `§ 26, stk. 1 afstand` and `§ 26, stk. 2 sygdom` — exist verbatim in `seed_lookup_data.sql`.
 - The `sfo` → `institution` rename (migration 013) does not affect this bot: it sends neither field.

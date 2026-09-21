@@ -1,9 +1,11 @@
 """Module to handle queue population"""
 
 import asyncio
+import calendar
 import json
 import logging
 import re
+from datetime import date
 from itertools import groupby
 
 import pyodbc
@@ -259,6 +261,81 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
     return resolved
 
 
+def _one_month_on(day: date) -> date:
+    """The same day one month later, clamped to the end of a shorter month."""
+
+    year = day.year + (day.month // 12)
+    month = day.month % 12 + 1
+
+    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _as_date(value) -> date | None:
+    """Parse a BefordringsData date, or None when it is absent or unreadable."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, date):
+        return value
+
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _bucket_key(row: dict, today: date, window_end: date) -> tuple:
+    """Which bevilling a BefordringsData row belongs to, within its case.
+
+    The old grouping put every distinct (BevillingFra, BevillingTil) on its own
+    bevilling. That cannot be converted as-is: usp_recalculate_bevilling_status
+    fails a citizen who ends up with more than one ACTIVE bevilling, and a
+    student with two overlapping legacy rows would produce exactly that — the
+    whole case lands on Fejlet.
+
+    So rows are bucketed by when they apply rather than by their exact dates:
+
+      ("current",)            period overlaps [today, window_end]
+                              -> ONE bevilling, which the status engine will
+                                 compute as Aktiv. Merging these is the point.
+
+      ("future",)             period starts after window_end
+                              -> ONE bevilling, computed as Kommende. Also
+                                 merged, even where the periods are far apart:
+                                 the legacy data is not detailed enough to
+                                 split them into meaningful separate
+                                 bevillinger, and only one may be Aktiv later.
+
+      ("past", fra, til)      everything else — already ended
+                              -> one bevilling per distinct period, as before.
+                                 These compute as Udløbet, and Udløbet does not
+                                 collide.
+
+      ("ukendt", fra, til)    dates missing or unreadable
+                              -> kept apart under the raw values rather than
+                                 guessed into a bucket. Logged by the caller.
+
+    Nothing here assigns a status: the status engine derives Aktiv / Kommende /
+    Udløbet from the kørselsrække dates once the rows exist. This only decides
+    which rows share a bevilling.
+    """
+
+    fra = _as_date(row.get("BevillingFra"))
+    til = _as_date(row.get("BevillingTil"))
+
+    if fra is None or til is None:
+        return ("ukendt", str(row.get("BevillingFra")), str(row.get("BevillingTil")))
+
+    if fra <= window_end and til >= today:
+        return ("current",)
+
+    if fra > window_end:
+        return ("future",)
+
+    return ("past", fra.isoformat(), til.isoformat())
+
+
 def retrieve_items_for_queue() -> list[dict]:
     """
     Read befordring rows from [RPA].[rpa].[BefordringsData] and group them
@@ -305,17 +382,50 @@ def retrieve_items_for_queue() -> list[dict]:
     # --- Resolve every distinct address up front ---
     adresse_ids = _resolve_adresse_ids(rows)
 
+    today = date.today()
+    window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
+
+    logger.info(
+        "Conversion window: %s to %s. Rows overlapping it become each "
+        "student's one active bevilling.\n",
+        today.isoformat(),
+        window_end.isoformat(),
+    )
+
+    undated = [r for r in rows if _bucket_key(r, today, window_end)[0] == "ukendt"]
+
+    if undated:
+        logger.warning(
+            "%d row(s) have missing or unreadable BevillingFra/BevillingTil. "
+            "They are kept on separate bevillinger under their raw values "
+            "rather than guessed into a bucket. Cases: %s\n",
+            len(undated),
+            ", ".join(sorted({str(r.get("CaseID")) for r in undated})),
+        )
+
     items = []
+    ambiguous_cases: list[str] = []
+
+    # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
+    # The query orders by CaseID alone, which left the inner grouping at the
+    # mercy of row order — a case whose rows ran date-pair A, B, A produced
+    # three bevillinger instead of two.
+    rows = sorted(rows, key=lambda r: str(r["CaseID"]))
 
     for ppr_case_id, case_iter in groupby(rows, key=lambda r: r["CaseID"]):
         case_rows = list(case_iter)
         person_ssn = case_rows[0].get("CPR", "")
 
-        # Within each case, group rows into bevillinger by (BevillingFra, BevillingTil).
-        # Rows sharing the same date pair are kørselsrækker under the same bevilling.
-        # Rows with different date pairs are separate (e.g. outdated) bevillinger.
+        # Within each case, rows are bucketed by when they apply — see
+        # _bucket_key for why current and future rows are merged rather than
+        # split by their exact dates.
+        def bucket_of(row):
+            return _bucket_key(row, today, window_end)
+
+        case_rows = sorted(case_rows, key=lambda r: (bucket_of(r), str(r.get("CaseDBID") or "")))
+
         bevillinger = []
-        for bev_key, bev_iter in groupby(case_rows, key=lambda r: (r["BevillingFra"], r["BevillingTil"])):
+        for bev_key, bev_iter in groupby(case_rows, key=bucket_of):
             bev_rows = list(bev_iter)
             first = bev_rows[0]
 
@@ -353,11 +463,38 @@ def retrieve_items_for_queue() -> list[dict]:
                 None,
             )
 
+            # The earliest date the bevilling's kørsel starts. Two jobs:
+            # it is the value the application's own "ny bevilling" flow seeds
+            # gyldig_fra from, and it is what makes a converted bevilling
+            # identifiable on a re-run — every bevilling in a case shares the
+            # same esdh_noegle, so (esdh_noegle, foerste_koersel_dato) is the
+            # only pair that tells them apart.
+            starts = [d for d in (_as_date(r.get("BevillingFra")) for r in bev_rows) if d]
+            foerste_koersel_dato = min(starts).isoformat() if starts else None
+
             bevillinger.append({
                 **bevilling_data,
                 "adresse_id": bevilling_adresse_id,
+                "bucket": bev_key[0],
+                "foerste_koersel_dato": foerste_koersel_dato,
                 "koerselsraekker": koerselsraekker,
             })
+
+        # (esdh_noegle, foerste_koersel_dato) is what tells one converted
+        # bevilling from another on a re-run, and esdh_noegle is the same for
+        # the whole case — so two buckets starting on the same day are
+        # indistinguishable afterwards. That happens when a short bevilling
+        # and a longer one begin on the same date and only one has ended.
+        #
+        # A clean first run converts both correctly; only a RESUME after a
+        # partial failure would skip the second. Warned rather than rejected,
+        # because the case is otherwise perfectly convertible — but these are
+        # the cases to check by hand if the conversion ever has to be
+        # restarted part-way.
+        starts = [b["foerste_koersel_dato"] for b in bevillinger if b["foerste_koersel_dato"]]
+
+        if len(set(starts)) != len(starts):
+            ambiguous_cases.append(str(ppr_case_id))
 
         items.append({
             "reference": ppr_case_id,
@@ -372,6 +509,16 @@ def retrieve_items_for_queue() -> list[dict]:
         "Grouped into %d queue item(s) by PPR case ID.\n",
         len(items),
     )
+
+    if ambiguous_cases:
+        logger.warning(
+            "%d case(s) have two or more bevillinger starting on the same "
+            "date, so they cannot be told apart on a resumed run. They "
+            "convert correctly on a clean run; check these by hand if the "
+            "conversion is ever restarted part-way:\n%s\n",
+            len(ambiguous_cases),
+            "\n".join(f"  {case}" for case in sorted(ambiguous_cases)),
+        )
 
     return items
 

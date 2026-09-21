@@ -84,6 +84,21 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 }
 
 
+# BefordringsData has no rutetype — the new system does, and its own form
+# requires one. The legacy TidspunktForBevilling implies it well enough:
+# a morning-only bevilling runs one way, an afternoon-only one the other, and
+# a bevilling covering both runs in both directions.
+#
+# Keys are lowercased to match _build_lookup_map and the normalisation applied
+# to the source value. Values must match Rutetype.rutetype_tekst exactly —
+# note "Skole til hjem", not "Fra skole til hjem".
+_RUTETYPE_FROM_TIDSPUNKT: dict[str, str] = {
+    "morgen": "Hjem til skole",
+    "eftermiddag": "Skole til hjem",
+    "morgen og eftermiddag": "Mellem hjem og skole",
+}
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -91,7 +106,6 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 def create_bevilling(
     ppr_case_id: str,
     person_ssn: str,
-    bor_case_id: str,
     bevillinger: list[dict],
 ) -> None:
     """
@@ -112,7 +126,6 @@ def create_bevilling(
         ppr_case_id:      Source PPR case ID (for logging).
         person_ssn:       Citizen SSN (CPR).
         person_full_name: Citizen full name resolved from GO contact lookup.
-        bor_case_id:      Resolved BOR case ID, stored as esdh_noegle.
         bevillinger:      Grouped bevilling list from BefordringsData. Each
                           entry carries its own adresse_id.
     """
@@ -125,6 +138,8 @@ def create_bevilling(
     hjemler = _fetch_lookup(api_endpoint, api_key, "/lookup/hjemler")
     sagsbehandlere = _fetch_lookup(api_endpoint, api_key, "/lookup/sagsbehandlere")
     skolematrikler = _fetch_lookup(api_endpoint, api_key, "/lookup/skolematrikel")
+    dage = _fetch_lookup(api_endpoint, api_key, "/lookup/dage")
+    rutetyper = _fetch_lookup(api_endpoint, api_key, "/lookup/rutetyper")
 
     # All lookup endpoints return {"id": ..., "label": ...}
     tidspunkt_map = _build_lookup_map(tidspunkter, name_key="label", id_key="id")
@@ -133,6 +148,42 @@ def create_bevilling(
 
     # Plain name → id map for the DB hjemmel table
     hjemmel_map = _build_lookup_map(hjemler, name_key="label", id_key="id")
+
+    rutetype_map = _build_lookup_map(rutetyper, name_key="label", id_key="id")
+
+    # Fail at startup, not per row: every tidspunkt that survives the check in
+    # the kørselsrække loop is one of these three, so a target that no longer
+    # exists in the Rutetype table would otherwise silently leave rutetype_id
+    # unset on every single converted række.
+    missing_rutetyper = [
+        navn
+        for navn in _RUTETYPE_FROM_TIDSPUNKT.values()
+        if navn.lower() not in rutetype_map
+    ]
+
+    if missing_rutetyper:
+        raise ProcessError(
+            "Rutetype(r) named in _RUTETYPE_FROM_TIDSPUNKT do not exist in "
+            f"the Rutetype lookup table: {', '.join(missing_rutetyper)}. "
+            "Check for a renamed value."
+        )
+
+    # "Alle" — the weekday option meaning every school day.
+    #
+    # BefordringsData records no weekdays at all, but the application's own
+    # kørselsrække form requires them: a converted række left without any
+    # cannot be saved when a caseworker next edits it. "Alle" is the closest
+    # honest default for a standing arrangement, and DagePicker treats it as
+    # mutually exclusive with the individual days, so a caseworker narrowing it
+    # later replaces it rather than adding to it.
+    dag_map = _build_lookup_map(dage, name_key="label", id_key="id")
+    alle_dage_id = dag_map.get("alle")
+
+    if alle_dage_id is None:
+        raise ProcessError(
+            "No 'Alle' entry in /lookup/dage — cannot set weekdays on converted "
+            "kørselsrækker. Check the Ugedag lookup table."
+        )
 
     # Skolematrikel map: skolekode (string) → matrikel_id
     # /lookup/skolematrikel returns {"id": matrikel_id, "label": naam, "skolekode": ...}
@@ -185,9 +236,17 @@ def create_bevilling(
     logger.info("Student %s exists in Elev.\n", person_ssn)
 
     # --- Fetch existing bevillinger for this student to avoid duplicates ---
-    # If a bevilling with the same esdh_noegle (BOR case ID) already exists
-    # for this student, the item has already been (partially) processed and
-    # we skip it rather than creating a duplicate.
+    # Keyed on (esdh_noegle, foerste_koersel_dato), not esdh_noegle alone.
+    #
+    # Every bevilling converted from one PPR case carries the same
+    # esdh_noegle — the case id — so that alone cannot tell them apart. The
+    # old check asked "does this case have any bevilling?", which meant a run
+    # that died after creating the first of three would, on retry, skip all
+    # three: the two that were never created included.
+    #
+    # foerste_koersel_dato is the earliest BevillingFra in the bucket, so the
+    # pair identifies a single converted bevilling and a retry resumes exactly
+    # where it stopped.
     existing_bev_response = requests.get(
         f"{api_endpoint}/bevilling/get_student_bevillinger/{person_ssn}",
         headers=headers,
@@ -199,29 +258,45 @@ def create_bevilling(
             f"{existing_bev_response.status_code} — {existing_bev_response.text}"
         )
 
-    existing_esdh_noegler = {
-        b.get("esdh_noegle")
-        for b in (existing_bev_response.json() or [])
-        if b.get("esdh_noegle")
+    def _identity(esdh_noegle, foerste_koersel_dato) -> tuple[str, str] | None:
+        """The pair identifying one converted bevilling, or None if unusable."""
+
+        if not esdh_noegle or not foerste_koersel_dato:
+            return None
+
+        return (str(esdh_noegle), str(foerste_koersel_dato)[:10])
+
+    existing_identities = {
+        identity
+        for identity in (
+            _identity(b.get("esdh_noegle"), b.get("foerste_koersel_dato"))
+            for b in (existing_bev_response.json() or [])
+        )
+        if identity
     }
 
     logger.info(
-        "Creating %d bevilling(er) for SSN %s linked to BOR case %s\n",
+        "Creating %d bevilling(er) for SSN %s linked to PPR case %s\n",
         len(bevillinger),
         person_ssn,
-        bor_case_id,
+        ppr_case_id,
     )
 
     for i, bevilling in enumerate(bevillinger, start=1):
         koerselsraekker = bevilling.get("koerselsraekker", [])
+        foerste_koersel_dato = bevilling.get("foerste_koersel_dato")
 
-        if bor_case_id in existing_esdh_noegler:
+        identity = _identity(ppr_case_id, foerste_koersel_dato)
+
+        if identity and identity in existing_identities:
             logger.info(
-                "  Bevilling %d/%d already exists for SSN %s (esdh_noegle: %s) — skipping.\n",
+                "  Bevilling %d/%d already exists for SSN %s "
+                "(esdh_noegle: %s, foerste_koersel_dato: %s) — skipping.\n",
                 i,
                 len(bevillinger),
                 person_ssn,
-                bor_case_id,
+                ppr_case_id,
+                foerste_koersel_dato,
             )
             continue
 
@@ -253,7 +328,10 @@ def create_bevilling(
             "matrikel_id": matrikel_id,
             "hjemmel_id": hjemmel_id,
             "sagsbehandler_id": sagsbehandler_id,
-            "esdh_noegle": bor_case_id,
+            # The PPR case id. There is no separate ESDH case to resolve —
+            # the borgersag flow this bot once had was scrapped, so the source
+            # case id is the reference that goes on the bevilling.
+            "esdh_noegle": ppr_case_id,
             "revurderingsdato": revurderingsdato,
             "begrundelse_fra_formular": begrundelse,
             # "Kørsel" until migration 009 in the befordring repo renamed it
@@ -263,15 +341,19 @@ def create_bevilling(
             # standing arrangements, so "Fast kørsel" is the right half.
             "ansoegningstype": "Fast kørsel",
             "ansoegningsdato": _parse_date(bevilling.get("CreationDate")),
+            # Also the de-duplication key — see above.
+            "foerste_koersel_dato": foerste_koersel_dato,
         }
 
         # Strip None values — API uses exclude_none=True server-side
         bevilling_payload = {k: v for k, v in bevilling_payload.items() if v is not None}
 
         logger.info(
-            "  Bevilling %d/%d | skole: %s (id: %s) | hjemmel: %r → %s | %d koerselsraekke(r)\n",
+            "  Bevilling %d/%d [%s] | skole: %s (id: %s) | hjemmel: %r → %s | "
+            "%d koerselsraekke(r)\n",
             i,
             len(bevillinger),
+            bevilling.get("bucket", "?"),
             bevilling.get("SkoleNavnBefordring"),
             matrikel_id,
             bevilling.get("HjemmelForBevilling"),
@@ -297,6 +379,9 @@ def create_bevilling(
         new_bevilling_id = create_bev_response.json().get("bevilling_id")
         logger.info("  Created bevilling id: %s\n", new_bevilling_id)
 
+        if identity:
+            existing_identities.add(identity)
+
         # --- POST: create each koerselsraekke ---
         for j, kr in enumerate(koerselsraekker, start=1):
             raw_tidspunkt = (kr.get("TidspunktForBevilling") or "").strip().lower()
@@ -304,6 +389,13 @@ def create_bevilling(
 
             tidspunkt_id = tidspunkt_map.get(raw_tidspunkt)
             befordringstype_id = koerselstype_map.get(raw_koerselstype)
+
+            # Derived from the tidspunkt — see _RUTETYPE_FROM_TIDSPUNKT. Safe
+            # to look up unguarded: the tidspunkt check below rejects anything
+            # outside the three known values, and the startup check above
+            # proved each maps to a real rutetype.
+            rutetype_navn = _RUTETYPE_FROM_TIDSPUNKT.get(raw_tidspunkt)
+            rutetype_id = rutetype_map.get(rutetype_navn.lower()) if rutetype_navn else None
 
             if not tidspunkt_id:
                 raise BusinessError(
@@ -321,20 +413,24 @@ def create_bevilling(
                 "gyldig_til": kr.get("BevillingTil"),
                 "tidspunkt_id": tidspunkt_id,
                 "befordringstype_id": befordringstype_id,
+                "rutetype_id": rutetype_id,
                 "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
                 "kommentar": kr.get("Kommentar") or None,
+                "dag_ids": [alle_dage_id],
             }
 
             koersel_payload = {k: v for k, v in koersel_payload.items() if v is not None}
 
             logger.info(
-                "    Koerselsraekke %d/%d | %s -> %s | type: %s | tidspunkt: %s\n",
+                "    Koerselsraekke %d/%d | %s -> %s | type: %s | "
+                "tidspunkt: %s -> rutetype: %s\n",
                 j,
                 len(koerselsraekker),
                 kr.get("BevillingFra"),
                 kr.get("BevillingTil"),
                 kr.get("BevillingAfKoerselstype"),
                 kr.get("TidspunktForBevilling"),
+                rutetype_navn,
             )
 
             create_kr_response = requests.post(

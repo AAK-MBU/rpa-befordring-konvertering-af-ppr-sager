@@ -31,7 +31,18 @@ Faserne er uafhængige og kan kombineres.
 
    `Bevilling.adresse_id` er `NOT NULL`, så en bevilling uden match kan ikke oprettes. `process_item` afviser hele sagen i det tilfælde frem for at konvertere den delvist.
 3. Danner **ét kø-item pr. PPR-sag** med `CaseID` som reference, så `--queue` kan køres igen uden at skabe dubletter.
-4. Grupperer rækkerne inden for sagen til **bevillinger efter `(BevillingFra, BevillingTil)`**. Rækker med samme datopar er kørselsrækker under samme bevilling; et andet datopar er en anden — ofte forældet — bevilling.
+4. Fordeler rækkerne inden for sagen på bevillinger efter **hvornår de gælder**:
+
+| Gruppe | Regel | Resultat |
+|---|---|---|
+| `current` | perioden overlapper `[i dag, vinduets slutning]` | **én** bevilling — beregnes som Aktiv |
+| `future` | perioden begynder efter vinduet | **én** bevilling — beregnes som Kommende |
+| `past` | allerede udløbet | én bevilling **pr. periode** — Udløbet, som ikke kolliderer |
+| `ukendt` | datoer mangler eller kan ikke læses | holdes for sig og logges |
+
+   Grunden til at de aktuelle rækker slås sammen: `usp_recalculate_bevilling_status` sætter en borger med mere end én **Aktiv** bevilling til Fejlet. To overlappende gamle rækker ville ramme netop det og vælte hele sagen.
+
+   Vinduet slutter en måned efter kørselsdatoen, eller på `config.CONVERSION_WINDOW_END`, hvis den er sat. Sæt den, når konverteringsdatoen er aftalt — så giver en gentaget kørsel samme gruppering.
 
 ### `--process`
 
@@ -53,6 +64,7 @@ Alle kald autentificeres med `X-API-Key`.
 |---|---|---|
 | `SkoleID` | `matrikel_id` | `/lookup/skolematrikel` returnerer `skolekode`, netop så denne robot kan bygge opslaget uden en ekstra forespørgsel |
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING` — de tre værdier, de gamle data faktisk indeholder |
+| `TidspunktForBevilling` | `tidspunkt_id` **og** `rutetype_id` | samme kolonne styrer begge: Morgen → Hjem til skole, Eftermiddag → Skole til hjem, Morgen og eftermiddag → Mellem hjem og skole |
 | `Revurdering` | `revurderingsdato` | en dato i fortiden nulstilles, så en konverteret bevilling ikke straks markeres til revurdering |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
@@ -67,16 +79,21 @@ Alle kald autentificeres med `X-API-Key`.
 
 Forbindelsen til RPA-databasen er **ikke** en miljøvariabel — den hentes fra `RPAConnection` under kørsel.
 
+## Hvis konverteringen skal genoptages
+
+Dublettjekket bruger `(esdh_noegle, foerste_koersel_dato)`. Alle bevillinger fra samme sag har samme `esdh_noegle`, så den alene kan kun svare på, om sagen har *nogen* bevilling — en kørsel, der døde efter den første af tre, ville ved næste forsøg springe alle tre over.
+
+To bevillinger i samme sag kan dog stadig begynde samme dag, og så kan de ikke skelnes bagefter. En ren kørsel konverterer begge korrekt; kun en genoptaget kørsel ville springe den anden over. Kø-fasen logger de sager, det gælder — tjek dem manuelt, hvis konverteringen genstartes undervejs.
+
 ## Før go-live
 
 Punkterne står udførligt i `CLAUDE.md`. Kort fortalt:
 
 - Elever oprettes ikke længere af denne robot. Alle nuværende elever ligger allerede i `Elev`, fordi nattekørslen indlæser hele elevudtrækket. Mangler et CPR, kender nattekørslen ikke personen — typisk fordi vedkommende er flyttet eller færdig med skolen — og sagen parkeres til manuel vurdering i stedet for at der oprettes en tom elevrække, som intet siden ville udfylde.
 - Adresseopslaget er ikke afprøvet mod hele datasættet. De to systemer skriver ikke adresser ens, og forskellen er ikke kun én ting: registret har LOIS' `SupplBynavn` med (`Kærlundvej 16, Ormslev, 8260 Viby J`), hvor de gamle data ikke har — men etage og dør (`Langkærvej 19, st. tv, ...`) står i begge og afgør, hvilken lejlighed der er tale om. Derfor sammenlignes vej og postnummer eksakt, mens de mellemliggende led matches som delsekvens: ekstra led hos kandidaten er i orden, manglende led er ikke. Mangler etage og dør i de gamle data, rammer opslaget alle lejligheder på adressen, og sagen afvises frem for at gætte. Første `--queue`-kørsel logger, hvor stor en andel der kunne slås op, og lister resten med antal kandidater.
-- Dublettjekket kan ikke genoptage en delvist gennemført kørsel: alle bevillinger i en sag deler samme `esdh_noegle`, så et forsøg nummer to springer dem alle over, også dem der aldrig blev oprettet.
-- `groupby` køres på usorterede rækker og kan derfor splitte én bevilling i flere.
 - `TOP (10)` står stadig i forespørgslen.
-- Kørselsrækker oprettes uden `dag_ids` og `rutetype_id`, som brugerfladen kræver, når rækken senere skal redigeres.
+- Ugedage sættes altid til "Alle". Kilden har dem ikke, så hver konverteret kørselsrække gælder alle skoledage. Det passer for en fast ordning, men ikke hvor to kørselstyper deler ugen mellem sig — de sager skal en sagsbehandler se på.
+- `view_Student_Bevillinger` skal gendeployes: `foerste_koersel_dato` er tilføjet til viewet, og uden den matcher dublettjekket aldrig.
 - SSL-bypass-blokken i `main.py` er udkommenteret, men står der endnu — den bør slettes.
 
 ## Udvikling
