@@ -472,11 +472,27 @@ def retrieve_items_for_queue() -> list[dict]:
             starts = [d for d in (_as_date(r.get("BevillingFra")) for r in bev_rows) if d]
             foerste_koersel_dato = min(starts).isoformat() if starts else None
 
+            # When the bevilling was last worked on. Taken as the NEWEST
+            # Modified across the bucket's rows, not the first non-None the
+            # bevilling-level pass would have picked: the rows were edited at
+            # different times, and the most recent one is what "last handled"
+            # means. ModifiedDate is the fallback where Modified is empty.
+            touched = [
+                d
+                for d in (
+                    _as_date(r.get("Modified")) or _as_date(r.get("ModifiedDate"))
+                    for r in bev_rows
+                )
+                if d
+            ]
+            sagsbehandlingsdato = max(touched).isoformat() if touched else None
+
             bevillinger.append({
                 **bevilling_data,
                 "adresse_id": bevilling_adresse_id,
                 "bucket": bev_key[0],
                 "foerste_koersel_dato": foerste_koersel_dato,
+                "sagsbehandlingsdato": sagsbehandlingsdato,
                 "koerselsraekker": koerselsraekker,
             })
 

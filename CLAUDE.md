@@ -62,6 +62,7 @@ Every call authenticates with `X-API-Key` from `API_KEY`.
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING`, a hardcoded dict of the three values the legacy data actually contains |
 | `Revurdering` | `revurderingsdato` | a **past** date is nulled out, so a converted bevilling is not immediately flagged for re-review |
 | *(not used)* | `sagsbehandler_id` | hardcoded to `_SAGSBEHANDLER_NAVN` — see below. The source `Sagsbehandler` column is **discarded** |
+| newest `Modified` in the bucket | `sagsbehandlingsdato` | when the bevilling was last worked on. The **newest** across the bucket's rows, not the first non-None — the rows were edited at different times. `ModifiedDate` is the fallback |
 | `CaseID` | `esdh_noegle` | the PPR case id. The borgersag flow this bot once had was scrapped, so there is no separate ESDH case to resolve — the source case id is the reference. Also half of the de-duplication key |
 
 ## Environment variables (`.env`)
@@ -114,6 +115,16 @@ Both grouping levels **sort before `groupby`**, which only groups consecutive eq
 De-duplication keys on `(esdh_noegle, foerste_koersel_dato)`. Every bevilling converted from one case carries the same `esdh_noegle` — the PPR case id — so that alone could only answer "does this case have *any* bevilling?". A run that died after creating the first of three would, on retry, skip all three.
 
 `foerste_koersel_dato` is the earliest `BevillingFra` in the bucket, written on create and read back from `view_Student_Bevillinger` (added to that view for this purpose). Newly created bevillinger are added to the in-memory set as they go, so two buckets cannot collide within a single run.
+
+A bevilling is created *before* its kørselsrækker, so a run that stops between the two leaves one with none — sitting at Påbegyndt with nothing on it. Existence alone is therefore the wrong question: `_has_koerselsraekker()` asks whether it is actually finished, and a bevilling that is not gets **completed** rather than skipped or duplicated.
+
+### Nothing is written until every lookup resolves
+
+`create_bevilling()` resolves and validates **all** of a bevilling's kørselsrækker before it creates the bevilling.
+
+It did not always. The lookups used to happen inside the POST loop, after the bevilling existed, so one unmappable value raised `BusinessError` with a bevilling already in the database — stranded at Påbegyndt with no kørselsrækker, and skipped as "already exists" on every retry afterwards. That is how the source's `"Egenbefordring"` spelling (see the normalisation section) left a case half-converted on a first clean run: the ATS retry loop re-processed the item, found the bevilling, and skipped it.
+
+Validating first means an unmappable value fails the case with nothing written — the only safe order for a one-shot migration. The `_has_koerselsraekker()` check above still matters, but now only for genuine mid-flight failures such as a dropped connection.
 
 **Known limit:** two buckets in one case can still share a start date — a short bevilling and a longer one beginning on the same day, where only one has ended. Those are indistinguishable afterwards. A clean run converts both correctly; only a *resumed* run would skip the second. The queue phase logs every such case by id, and those are the ones to check by hand if the conversion is ever restarted part-way.
 

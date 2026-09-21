@@ -178,6 +178,29 @@ _RUTETYPE_FROM_TIDSPUNKT: dict[str, str] = {
 }
 
 
+def _has_koerselsraekker(api_endpoint: str, headers: dict, bevilling_id: int) -> bool:
+    """Does this bevilling already have its kørselsrækker?
+
+    A bevilling is created before them, so one with none is not finished — it
+    is the debris of a run that stopped in between. Treating it as done is how
+    a bevilling ends up stuck at Påbegyndt with nothing on it.
+    """
+
+    response = requests.get(
+        f"{api_endpoint}/bevilling/get_bevilling_koerselsraekker/{bevilling_id}",
+        headers=headers,
+        timeout=30,
+    )
+
+    if not response.ok:
+        raise ProcessError(
+            f"Failed to read kørselsrækker for bevilling {bevilling_id}: "
+            f"{response.status_code} — {response.text}"
+        )
+
+    return bool(response.json())
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -360,14 +383,17 @@ def create_bevilling(
 
         return (str(esdh_noegle), str(foerste_koersel_dato)[:10])
 
-    existing_identities = {
-        identity
-        for identity in (
-            _identity(b.get("esdh_noegle"), b.get("foerste_koersel_dato"))
-            for b in (existing_bev_response.json() or [])
+    # identity -> bevilling_id, not just a set of identities: a bevilling that
+    # exists is not necessarily finished, and completing it needs its id.
+    existing_bevillinger: dict[tuple[str, str], int] = {}
+
+    for existing in existing_bev_response.json() or []:
+        identity = _identity(
+            existing.get("esdh_noegle"), existing.get("foerste_koersel_dato")
         )
-        if identity
-    }
+
+        if identity and existing.get("bevilling_id") is not None:
+            existing_bevillinger[identity] = existing["bevilling_id"]
 
     logger.info(
         "Creating %d bevilling(er) for SSN %s linked to PPR case %s\n",
@@ -381,18 +407,39 @@ def create_bevilling(
         foerste_koersel_dato = bevilling.get("foerste_koersel_dato")
 
         identity = _identity(ppr_case_id, foerste_koersel_dato)
+        existing_id = existing_bevillinger.get(identity) if identity else None
 
-        if identity and identity in existing_identities:
-            logger.info(
-                "  Bevilling %d/%d already exists for SSN %s "
-                "(esdh_noegle: %s, foerste_koersel_dato: %s) — skipping.\n",
+        # A bevilling is created before its kørselsrækker, so a run that died
+        # between the two leaves one with none. Skipping on "the bevilling
+        # exists" would strand it that way for good — which is exactly what
+        # happened: a bevilling sitting at Påbegyndt with no kørselsrækker,
+        # skipped on every retry.
+        #
+        # So existence is not the question. The question is whether it already
+        # has its kørselsrækker.
+        if existing_id is not None:
+            if _has_koerselsraekker(api_endpoint, headers, existing_id):
+                logger.info(
+                    "  Bevilling %d/%d already complete for SSN %s "
+                    "(id: %s, esdh_noegle: %s, foerste_koersel_dato: %s) — skipping.\n",
+                    i,
+                    len(bevillinger),
+                    person_ssn,
+                    existing_id,
+                    ppr_case_id,
+                    foerste_koersel_dato,
+                )
+                continue
+
+            logger.warning(
+                "  Bevilling %d/%d exists for SSN %s (id: %s) but has no "
+                "kørselsrækker — a previous run stopped part-way. Completing "
+                "it rather than creating a duplicate.\n",
                 i,
                 len(bevillinger),
                 person_ssn,
-                ppr_case_id,
-                foerste_koersel_dato,
+                existing_id,
             )
-            continue
 
         # --- Resolve bevilling-level lookup IDs ---
         skole_id = str(bevilling.get("SkoleID") or "").strip()
@@ -410,6 +457,69 @@ def create_bevilling(
         # immediately flag it for re-review.  Future dates are kept as-is.
         if revurderingsdato and date.fromisoformat(revurderingsdato) < date.today():
             revurderingsdato = None
+
+        # --- Resolve every kørselsrække BEFORE anything is written ---
+        #
+        # These used to be resolved inside the POST loop, i.e. after the
+        # bevilling already existed. One unmappable value then raised
+        # BusinessError with a bevilling already in the database — left at
+        # Påbegyndt with no kørselsrækker, and skipped as "already exists" on
+        # every retry. That is exactly how "Egenbefordring" (the source's
+        # spelling of "Egen befordring") stranded a case.
+        #
+        # Validating first means a bad value fails the case without writing
+        # anything, which is the only safe order for a one-shot migration.
+        prepared: list[tuple[dict, str | None, dict]] = []
+
+        for kr in koerselsraekker:
+            raw_tidspunkt = _normalise(kr.get("TidspunktForBevilling"))
+
+            tidspunkt_id = _resolve(
+                tidspunkt_map,
+                tidspunkt_labels,
+                kr.get("TidspunktForBevilling"),
+                "Tidspunkt",
+            )
+            befordringstype_id = _resolve(
+                koerselstype_map,
+                koerselstype_labels,
+                kr.get("BevillingAfKoerselstype"),
+                "Kørselstype",
+            )
+
+            if not tidspunkt_id:
+                raise BusinessError(
+                    f"Unknown TidspunktForBevilling {kr.get('TidspunktForBevilling')!r} "
+                    f"for PPR case {ppr_case_id} — check lookup table."
+                )
+
+            if not befordringstype_id:
+                raise BusinessError(
+                    f"Unknown BevillingAfKoerselstype {kr.get('BevillingAfKoerselstype')!r} "
+                    f"for PPR case {ppr_case_id} — check lookup table."
+                )
+
+            # Derived from the tidspunkt — see _RUTETYPE_FROM_TIDSPUNKT. Safe
+            # unguarded: the check above rejects anything outside the three
+            # known values, and the startup check proved each maps to a real
+            # rutetype.
+            rutetype_navn = _RUTETYPE_FROM_TIDSPUNKT.get(raw_tidspunkt)
+            rutetype_id = rutetype_map.get(_normalise(rutetype_navn)) if rutetype_navn else None
+
+            koersel_payload = {
+                "gyldig_fra": kr.get("BevillingFra"),
+                "gyldig_til": kr.get("BevillingTil"),
+                "tidspunkt_id": tidspunkt_id,
+                "befordringstype_id": befordringstype_id,
+                "rutetype_id": rutetype_id,
+                "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
+                "kommentar": kr.get("Kommentar") or None,
+                "dag_ids": [alle_dage_id],
+            }
+
+            koersel_payload = {k: v for k, v in koersel_payload.items() if v is not None}
+
+            prepared.append((koersel_payload, rutetype_navn, kr))
 
         bevilling_payload = {
             # Per bevilling, not per case: a student who moved has older
@@ -432,6 +542,9 @@ def create_bevilling(
             # standing arrangements, so "Fast kørsel" is the right half.
             "ansoegningstype": "Fast kørsel",
             "ansoegningsdato": _parse_date(bevilling.get("CreationDate")),
+            # Newest Modified across the bucket's source rows — computed in
+            # queue_handler, where the rows are still available.
+            "sagsbehandlingsdato": _parse_date(bevilling.get("sagsbehandlingsdato")),
             # Also the de-duplication key — see above.
             "foerste_koersel_dato": foerste_koersel_dato,
         }
@@ -452,80 +565,40 @@ def create_bevilling(
             len(koerselsraekker),
         )
 
-        # --- POST: create bevilling ---
-        create_bev_response = requests.post(
-            f"{api_endpoint}/bevilling/create_bevilling/{person_ssn}",
-            json=bevilling_payload,
-            headers=headers,
-            timeout=30,
-        )
-
-        if not create_bev_response.ok:
-            raise ProcessError(
-                f"Failed to create bevilling {i}/{len(bevillinger)} "
-                f"for PPR case {ppr_case_id}: "
-                f"{create_bev_response.status_code} — {create_bev_response.text}"
+        # --- POST: create bevilling, unless completing an existing one ---
+        if existing_id is not None:
+            new_bevilling_id = existing_id
+        else:
+            create_bev_response = requests.post(
+                f"{api_endpoint}/bevilling/create_bevilling/{person_ssn}",
+                json=bevilling_payload,
+                headers=headers,
+                timeout=30,
             )
 
-        new_bevilling_id = create_bev_response.json().get("bevilling_id")
-        logger.info("  Created bevilling id: %s\n", new_bevilling_id)
+            if not create_bev_response.ok:
+                raise ProcessError(
+                    f"Failed to create bevilling {i}/{len(bevillinger)} "
+                    f"for PPR case {ppr_case_id}: "
+                    f"{create_bev_response.status_code} — {create_bev_response.text}"
+                )
 
-        if identity:
-            existing_identities.add(identity)
+            new_bevilling_id = create_bev_response.json().get("bevilling_id")
+            logger.info("  Created bevilling id: %s\n", new_bevilling_id)
+
+            if identity:
+                existing_bevillinger[identity] = new_bevilling_id
 
         # --- POST: create each koerselsraekke ---
-        for j, kr in enumerate(koerselsraekker, start=1):
-            raw_tidspunkt = _normalise(kr.get("TidspunktForBevilling"))
-
-            tidspunkt_id = _resolve(
-                tidspunkt_map,
-                tidspunkt_labels,
-                kr.get("TidspunktForBevilling"),
-                "Tidspunkt",
-            )
-            befordringstype_id = _resolve(
-                koerselstype_map,
-                koerselstype_labels,
-                kr.get("BevillingAfKoerselstype"),
-                "Kørselstype",
-            )
-
-            # Derived from the tidspunkt — see _RUTETYPE_FROM_TIDSPUNKT. Safe
-            # to look up unguarded: the tidspunkt check below rejects anything
-            # outside the three known values, and the startup check above
-            # proved each maps to a real rutetype.
-            rutetype_navn = _RUTETYPE_FROM_TIDSPUNKT.get(raw_tidspunkt)
-            rutetype_id = rutetype_map.get(_normalise(rutetype_navn)) if rutetype_navn else None
-
-            if not tidspunkt_id:
-                raise BusinessError(
-                    f"Unknown TidspunktForBevilling {kr.get('TidspunktForBevilling')!r} "
-                    f"for PPR case {ppr_case_id} — check lookup table."
-                )
-            if not befordringstype_id:
-                raise BusinessError(
-                    f"Unknown BevillingAfKoerselstype {kr.get('BevillingAfKoerselstype')!r} "
-                    f"for PPR case {ppr_case_id} — check lookup table."
-                )
-
-            koersel_payload = {
-                "gyldig_fra": kr.get("BevillingFra"),
-                "gyldig_til": kr.get("BevillingTil"),
-                "tidspunkt_id": tidspunkt_id,
-                "befordringstype_id": befordringstype_id,
-                "rutetype_id": rutetype_id,
-                "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
-                "kommentar": kr.get("Kommentar") or None,
-                "dag_ids": [alle_dage_id],
-            }
-
-            koersel_payload = {k: v for k, v in koersel_payload.items() if v is not None}
-
+        #
+        # The payloads were resolved and validated before the bevilling was
+        # created, so nothing here can fail on an unmappable lookup value.
+        for j, (koersel_payload, rutetype_navn, kr) in enumerate(prepared, start=1):
             logger.info(
                 "    Koerselsraekke %d/%d | %s -> %s | type: %s | "
                 "tidspunkt: %s -> rutetype: %s\n",
                 j,
-                len(koerselsraekker),
+                len(prepared),
                 kr.get("BevillingFra"),
                 kr.get("BevillingTil"),
                 kr.get("BevillingAfKoerselstype"),
@@ -542,7 +615,7 @@ def create_bevilling(
 
             if not create_kr_response.ok:
                 raise ProcessError(
-                    f"Failed to create koerselsraekke {j}/{len(koerselsraekker)} "
+                    f"Failed to create koerselsraekke {j}/{len(prepared)} "
                     f"on bevilling {new_bevilling_id} for PPR case {ppr_case_id}: "
                     f"{create_kr_response.status_code} — {create_kr_response.text}"
                 )

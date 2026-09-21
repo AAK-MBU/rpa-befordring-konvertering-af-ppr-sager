@@ -68,6 +68,7 @@ Alle kald autentificeres med `X-API-Key`.
 | `TidspunktForBevilling` | `tidspunkt_id` **og** `rutetype_id` | samme kolonne styrer begge: Morgen → Hjem til skole, Eftermiddag → Skole til hjem, Morgen og eftermiddag → Mellem hjem og skole |
 | `Revurdering` | `revurderingsdato` | en dato i fortiden nulstilles, så en konverteret bevilling ikke straks markeres til revurdering |
 | *(bruges ikke)* | `sagsbehandler_id` | fast sat til `_SAGSBEHANDLER_NAVN` (p.t. "Sofie"). Kildens `Sagsbehandler`-kolonne kasseres — navnene er gamle PPR-medarbejdere og passer ikke med `Sagsbehandler`-tabellen, som indeholder rigtige, nuværende medarbejdere |
+| nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
 ## Miljøvariabler (`.env`)
@@ -84,6 +85,10 @@ Forbindelsen til RPA-databasen er **ikke** en miljøvariabel — den hentes fra 
 ## Hvis konverteringen skal genoptages
 
 Dublettjekket bruger `(esdh_noegle, foerste_koersel_dato)`. Alle bevillinger fra samme sag har samme `esdh_noegle`, så den alene kan kun svare på, om sagen har *nogen* bevilling — en kørsel, der døde efter den første af tre, ville ved næste forsøg springe alle tre over.
+
+En bevilling oprettes *før* sine kørselsrækker, så en kørsel, der døde imellem de to, efterlader en bevilling uden rækker — stående på Påbegyndt uden indhold. Derfor er "findes den?" det forkerte spørgsmål: robotten tjekker, om den rent faktisk har kørselsrækker, og færdiggør den, hvis ikke, frem for at springe over eller oprette en dublet.
+
+Alle kørselsrækker slås desuden op og valideres, *før* bevillingen oprettes. Tidligere skete opslaget inde i POST-løkken, altså efter bevillingen fandtes, så én uoversættelig værdi efterlod en tom bevilling — præcis det, kildens stavemåde `Egenbefordring` udløste. Nu fejler sagen uden at skrive noget.
 
 To bevillinger i samme sag kan dog stadig begynde samme dag, og så kan de ikke skelnes bagefter. En ren kørsel konverterer begge korrekt; kun en genoptaget kørsel ville springe den anden over. Kø-fasen logger de sager, det gælder — tjek dem manuelt, hvis konverteringen genstartes undervejs.
 
