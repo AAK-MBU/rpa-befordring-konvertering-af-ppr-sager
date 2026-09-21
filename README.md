@@ -25,7 +25,7 @@ Faserne er uafhængige og kan kombineres.
 `retrieve_items_for_queue()` i `processes/queue_handler.py` står for hele grupperingen:
 
 1. Læser `BefordringsData` fra RPA-databasen (forbindelsen hentes fra `RPAConnection`).
-2. Slår op, hvilken adresse **hver bevilling er givet på**, i befordringsapplikationens egen `Adresse`-tabel via `/adresse/by-tekst` og `/adresse/search`. Den tabel er en fuld kopi af kommunens adresseregister, som `rpa-befordring-nightly-runs` opdaterer hver nat — så robotten henter ikke længere selv fra LOIS, og hele konverteringen går gennem ét API.
+2. Slår op, hvilken adresse **hver bevilling er givet på**, i befordringsapplikationens egen `Adresse`-tabel via `/adresse/search`. Den tabel er en fuld kopi af kommunens adresseregister, som `rpa-befordring-nightly-runs` opdaterer hver nat — så robotten henter ikke længere selv fra LOIS, og hele konverteringen går gennem ét API.
 
    Det er ikke elevens nuværende adresse: den ligger allerede på `Elev` fra nattekørslen. `Bevilling.adresse_id` fortæller, hvor den enkelte bevilling blev givet, og en elev, der er flyttet, har ældre bevillinger på den gamle adresse — derfor slås den op pr. bevilling og ikke pr. sag.
 
@@ -72,7 +72,7 @@ Forbindelsen til RPA-databasen er **ikke** en miljøvariabel — den hentes fra 
 Punkterne står udførligt i `CLAUDE.md`. Kort fortalt:
 
 - Elever oprettes ikke længere af denne robot. Alle nuværende elever ligger allerede i `Elev`, fordi nattekørslen indlæser hele elevudtrækket. Mangler et CPR, kender nattekørslen ikke personen — typisk fordi vedkommende er flyttet eller færdig med skolen — og sagen parkeres til manuel vurdering i stedet for at der oprettes en tom elevrække, som intet siden ville udfylde.
-- Adresseopslaget er endnu ikke afprøvet mod rigtige data. `/adresse/by-tekst` matcher eksakt og versalfølsomt, og det er ikke bekræftet, at `ElevensAdresse` / `ElevensPostnummer` staves som `adresse_tekst`. Første `--queue`-kørsel logger, hvor stor en andel der kunne slås op, og lister resten — læs den, før konverteringen sættes i gang.
+- Adresseopslaget er ikke afprøvet mod hele datasættet. De to systemer skriver ikke adresser ens — adresseregistret har LOIS' `SupplBynavn` med (`Kærlundvej 16, Ormslev, 8260 Viby J`), hvor de gamle data ikke har (`Kærlundvej 16, 8260 Viby J`). Derfor sammenlignes kun `(vej + nummer, postnummer)`, og alt derimellem ignoreres. Første `--queue`-kørsel logger, hvor stor en andel der kunne slås op, og lister resten med antal kandidater — læs den, før konverteringen sættes i gang.
 - Dublettjekket kan ikke genoptage en delvist gennemført kørsel: alle bevillinger i en sag deler samme `esdh_noegle`, så et forsøg nummer to springer dem alle over, også dem der aldrig blev oprettet.
 - `groupby` køres på usorterede rækker og kan derfor splitte én bevilling i flere.
 - `TOP (10)` står stadig i forespørgslen.

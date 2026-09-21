@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from itertools import groupby
 
 import pyodbc
@@ -43,22 +44,91 @@ _KOERSELSRAEKKE_FIELDS = {
 }
 
 
-def _address_key(row: dict) -> tuple[str, str] | None:
-    """The (street, postal) pair identifying the address a row's bevilling is for.
+_POSTCODE = re.compile(r"^(\d{4})\b")
 
-    Not the student's current address — that already sits on Elev, put there by
-    the nightly run, and nothing here needs to look it up. This is the address
-    the legacy bevilling was granted against, which becomes Bevilling.adresse_id
-    and is what adresse_mismatch later compares to the student's own.
+
+def _split_adresse(tekst: str) -> tuple[str, str] | None:
+    """Split a Danish address string into (street + number, postcode).
+
+    Both sides of the comparison are reduced to these two parts, because the
+    two systems do not write the middle the same way. The address register
+    carries LOIS's SupplBynavn where one exists; BefordringsData does not:
+
+        BefordringsData  "Kærlundvej 16, 8260 Viby J"
+        Adresse          "Kærlundvej 16, Ormslev, 8260 Viby J"
+
+    Same address. Comparing the full strings — or matching on a prefix of one
+    against the other — gets this wrong in both directions. Comparing
+    (street, postcode) gets it right and ignores everything in between.
+
+    Returns None when there is no street part to work with.
     """
 
-    adresse = str(row.get("ElevensAdresse") or "").strip()
-    postnummer = str(row.get("ElevensPostnummer") or "").strip()
+    parts = [part.strip() for part in str(tekst or "").split(",") if part.strip()]
 
-    if not adresse or not postnummer:
+    if not parts:
         return None
 
-    return (adresse, postnummer)
+    # Collapse runs of whitespace so "Kærlundvej  16" matches "Kærlundvej 16".
+    street = " ".join(parts[0].split())
+
+    postcode = ""
+    if len(parts) > 1:
+        match = _POSTCODE.match(parts[-1])
+        if match:
+            postcode = match.group(1)
+
+    return street, postcode
+
+
+def _matches(adresse_tekst: str | None, street: str, postcode: str) -> bool:
+    """Does a candidate from the register describe this street and postcode?
+
+    Case-insensitive on the street, exact on the postcode. Whatever sits
+    between them — a supplementary place name like "Ormslev" — is ignored,
+    which is the whole point of comparing parsed parts.
+    """
+
+    parsed = _split_adresse(adresse_tekst)
+
+    if parsed is None:
+        return False
+
+    candidate_street, candidate_postcode = parsed
+
+    return (
+        candidate_street.casefold() == street.casefold()
+        and candidate_postcode == postcode
+    )
+
+
+def _address_key(row: dict) -> tuple[str, str] | None:
+    """The (street, postcode) pair for the address a row's bevilling is for.
+
+    Not the student's current address — that already sits on Elev, put there
+    by the nightly run, and nothing here needs to look it up. This is the
+    address the legacy bevilling was granted against, which becomes
+    Bevilling.adresse_id and is what adresse_mismatch later compares to the
+    student's own.
+
+    ElevensAdresse already carries the postcode and city, so ElevensPostnummer
+    is only a fallback for a row whose address string is missing it.
+    """
+
+    parsed = _split_adresse(row.get("ElevensAdresse"))
+
+    if parsed is None:
+        return None
+
+    street, postcode = parsed
+
+    if not postcode:
+        postcode = str(row.get("ElevensPostnummer") or "").strip()
+
+    if not street or not postcode:
+        return None
+
+    return (street, postcode)
 
 
 def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
@@ -71,27 +141,27 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
     to reach into LOIS on server 29 itself, and it keeps the conversion
     API-only rather than half API, half direct database.
 
-    Two attempts per address, because BefordringsData and the address register
-    do not necessarily spell an address the same way:
+    Each address is searched by "<street>," as a PREFIX, then the candidates
+    are compared on parsed (street, postcode).
 
-      1. Exact match on "<adresse>, <postnummer>" via /adresse/by-tekst.
-         GET /adresse/by-tekst is case-sensitive and exact, so this only hits
-         when the two systems agree character for character.
+    The trailing comma is what makes the prefix safe. Every adresse_tekst has
+    one immediately after the house number, so "Kærlundvej 16," matches
+    "Kærlundvej 16, Ormslev, 8260 Viby J" but not "Kærlundvej 160, ..." or
+    "Kærlundvej 16A, ...". Without it, searching for house 1 pulls in 1, 10,
+    11 and everything else starting with those digits — and /adresse/search
+    caps at 15 rows, so the one wanted could be pushed out entirely.
 
-      2. Prefix search on the street part via /adresse/search, keeping only
-         candidates whose text also contains the postal code. Accepted ONLY
-         when exactly one candidate survives — "Grøndalsvej 1" is a prefix of
-         "Grøndalsvej 10" and "Grøndalsvej 11" too, and putting a child at the
-         wrong house is worse than failing to place them at all.
+    Accepted only when exactly one candidate matches on (street, postcode).
+    Placing a bevilling at the wrong address is worse than failing to place it.
 
     Args:
         rows: BefordringsData rows.
 
     Returns:
-        dict mapping (adresse, postnummer) -> adresse_id. Addresses that
-        resolve to nothing, or to more than one candidate, are omitted and
-        logged; the bevilling using them is then rejected for manual
-        follow-up, since Bevilling.adresse_id is NOT NULL.
+        dict mapping (street, postcode) -> adresse_id. Addresses that resolve
+        to nothing, or to more than one candidate, are omitted and logged; the
+        bevilling using them is then rejected for manual follow-up, since
+        Bevilling.adresse_id is NOT NULL.
     """
 
     api_endpoint, api_key = get_api_credentials()
@@ -100,65 +170,33 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
     keys = {key for key in (_address_key(row) for row in rows) if key}
 
     resolved: dict[tuple[str, str], str] = {}
-    unresolved: list[tuple[str, str]] = []
+    unresolved: list[tuple[tuple[str, str], int]] = []
 
-    for adresse, postnummer in sorted(keys):
-        full_text = f"{adresse}, {postnummer}"
-
-        exact = requests.get(
-            f"{api_endpoint}/adresse/by-tekst",
-            params={"tekst": full_text},
-            headers=headers,
-            timeout=30,
-        )
-
-        if not exact.ok:
-            raise ProcessError(
-                f"Address lookup failed for {full_text!r}: "
-                f"{exact.status_code} — {exact.text}"
-            )
-
-        match = exact.json()
-
-        if match:
-            resolved[(adresse, postnummer)] = match["adresse_id"]
-            continue
-
-        # Fall back to a prefix search on the street part.
-        search = requests.get(
+    for street, postcode in sorted(keys):
+        response = requests.get(
             f"{api_endpoint}/adresse/search",
-            params={"q": adresse},
+            params={"q": f"{street},"},
             headers=headers,
             timeout=30,
         )
 
-        if not search.ok:
+        if not response.ok:
             raise ProcessError(
-                f"Address search failed for {adresse!r}: "
-                f"{search.status_code} — {search.text}"
+                f"Address search failed for {street!r}: "
+                f"{response.status_code} — {response.text}"
             )
 
         candidates = [
             candidate
-            for candidate in (search.json() or [])
-            if postnummer in (candidate.get("adresse_tekst") or "")
+            for candidate in (response.json() or [])
+            if _matches(candidate.get("adresse_tekst"), street, postcode)
         ]
 
         if len(candidates) == 1:
-            resolved[(adresse, postnummer)] = candidates[0]["adresse_id"]
-            logger.info(
-                "Address %r matched by prefix search to %r",
-                full_text,
-                candidates[0]["adresse_tekst"],
-            )
+            resolved[(street, postcode)] = candidates[0]["adresse_id"]
             continue
 
-        unresolved.append((adresse, postnummer))
-        logger.warning(
-            "Could not resolve address %r — %d candidate(s) from prefix search",
-            full_text,
-            len(candidates),
-        )
+        unresolved.append(((street, postcode), len(candidates)))
 
     logger.info(
         "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
@@ -171,7 +209,10 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, str], str]:
             "%d address(es) unresolved — the bevillinger using them will be "
             "rejected for manual follow-up:\n%s\n",
             len(unresolved),
-            "\n".join(f"  {a}, {p}" for a, p in unresolved),
+            "\n".join(
+                f"  {street}, {postcode} — {count} candidate(s)"
+                for (street, postcode), count in unresolved
+            ),
         )
 
     return resolved

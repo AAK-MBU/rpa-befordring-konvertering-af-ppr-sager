@@ -32,7 +32,7 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 `retrieve_items_for_queue()` does the whole grouping job:
 
 1. Reads `BefordringsData` from the RPA database (connection string from `RPAConnection(db_env="PROD").get_constant("DbConnectionString")`).
-2. Resolves the address **each bevilling was granted against** to an `adresse_id`, via `/adresse/by-tekst` and `/adresse/search` against the befordring application's own `Adresse` table. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS and the conversion is API-only.
+2. Resolves the address **each bevilling was granted against** to an `adresse_id`, via `/adresse/search` against the befordring application's own `Adresse` table. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS and the conversion is API-only.
 
    Note this is *not* the student's current address — that already sits on `Elev`, put there by the nightly run, and nothing here looks it up. `Bevilling.adresse_id` records where a given bevilling was granted, which is what `adresse_mismatch` later compares against the student's own. A student who moved has older bevillinger at the previous address, so it is resolved **per bevilling**, not per case.
 
@@ -98,13 +98,24 @@ This bot used to `POST /citizen/create_elev` with just `{cpr, adresse_id}`. That
 
 So a miss now raises `BusinessError`, which sends the item to `pending_user` rather than failing it. Nothing the bot can do resolves it; a person has to decide whether that student should be converted at all.
 
-### Address resolution is unverified against real data
+### How addresses are matched
 
-`/adresse/by-tekst` is an **exact, case-sensitive** match on `"<adresse>, <postnummer>"`, and nobody has yet confirmed that `BefordringsData.ElevensAdresse` / `ElevensPostnummer` — the bevilling's address, despite the column names — spell an address the same way `Adresse.adresse_tekst` does (which comes from LOIS `AdresseBetegnelse`, e.g. `"Grøndalsvej 1, 8260 Viby J"` — note the postal code carries a city name).
+The two systems do not write an address the same way:
 
-The prefix-search fallback exists to absorb that, and it is deliberately strict: a candidate is accepted only when exactly one survives filtering by postal code, because `"Grøndalsvej 1"` is also a prefix of `"Grøndalsvej 10"`. Placing a child at the wrong house is worse than failing to place them.
+```
+BefordringsData   Kærlundvej 16, 8260 Viby J
+Adresse           Kærlundvej 16, Ormslev, 8260 Viby J
+```
 
-The first `--queue` run logs the resolution rate and lists every unresolved address. Read that before trusting the conversion — a low rate means the two systems format addresses differently, and the fix is normalisation in `_resolve_adresse_ids`, not a larger fallback.
+Same address. The register carries LOIS's `SupplBynavn` (`Ormslev`) where one exists; the legacy data does not. Note also that `ElevensAdresse` **already includes the postcode and city** — `ElevensPostnummer` is a separate column holding `8260` again, and appending it produces nonsense.
+
+So both sides are reduced to `(street + number, postcode)` by `_split_adresse()` — first comma-component and the four digits at the start of the last one — and everything in between is ignored. `_matches()` then compares case-insensitively on street, exactly on postcode.
+
+Lookup is `/adresse/search` with **`"<street>,"` including the trailing comma** as the prefix. Every `adresse_tekst` has a comma straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, 8260 Viby J"` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`. Without the comma, searching for house 1 pulls in 1, 10, 11 and the rest — and that endpoint caps at 15 rows, so the wanted one can be pushed out entirely.
+
+A candidate is accepted only when **exactly one** survives. Placing a bevilling at the wrong address is worse than failing to place it.
+
+Still unverified against the full dataset: the first `--queue` run logs the resolution rate and lists every unresolved address with its candidate count. Read it before trusting the conversion. A `0 candidate(s)` line means the address is absent or the street is spelled differently; `2+` means the trailing-comma trick did not disambiguate and that address needs looking at by hand.
 
 ## Verified compatible
 
