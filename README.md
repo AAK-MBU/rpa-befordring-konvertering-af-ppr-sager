@@ -66,6 +66,7 @@ Alle kald autentificeres med `X-API-Key`.
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING` — de tre værdier, de gamle data faktisk indeholder |
 | `TidspunktForBevilling` | `tidspunkt_id` **og** `rutetype_id` | samme kolonne styrer begge: Morgen → Hjem til skole, Eftermiddag → Skole til hjem, Morgen og eftermiddag → Mellem hjem og skole |
 | `Revurdering` | `revurderingsdato` | en dato i fortiden nulstilles, så en konverteret bevilling ikke straks markeres til revurdering |
+| *(bruges ikke)* | `sagsbehandler_id` | fast sat til `_SAGSBEHANDLER_NAVN` (p.t. "Sofie"). Kildens `Sagsbehandler`-kolonne kasseres — navnene er gamle PPR-medarbejdere og passer ikke med `Sagsbehandler`-tabellen, som indeholder rigtige, nuværende medarbejdere |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
 ## Miljøvariabler (`.env`)

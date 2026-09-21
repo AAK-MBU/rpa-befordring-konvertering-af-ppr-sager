@@ -92,6 +92,20 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 # Keys are lowercased to match _build_lookup_map and the normalisation applied
 # to the source value. Values must match Rutetype.rutetype_tekst exactly —
 # note "Skole til hjem", not "Fra skole til hjem".
+# Every converted bevilling is assigned to this caseworker.
+#
+# BefordringsData has a Sagsbehandler column, but the names in it are legacy
+# PPR staff and do not line up with the Sagsbehandler table — which is not
+# seeded reference data but real people, created and retired as staff change.
+# Matching on those names would leave most converted bevillinger with no
+# caseworker at all, and occasionally attach one to someone who has left.
+#
+# A single known owner is more useful: every converted bevilling is
+# identifiable and reassignable in one go. Change this when the business
+# decides who should own them.
+_SAGSBEHANDLER_NAVN = "Sofie"
+
+
 _RUTETYPE_FROM_TIDSPUNKT: dict[str, str] = {
     "morgen": "Hjem til skole",
     "eftermiddag": "Skole til hjem",
@@ -145,6 +159,15 @@ def create_bevilling(
     tidspunkt_map = _build_lookup_map(tidspunkter, name_key="label", id_key="id")
     koerselstype_map = _build_lookup_map(koerselstyper, name_key="label", id_key="id")
     sagsbehandler_map = _build_lookup_map(sagsbehandlere, name_key="label", id_key="id")
+
+    sagsbehandler_id = sagsbehandler_map.get(_SAGSBEHANDLER_NAVN.strip().lower())
+
+    if sagsbehandler_id is None:
+        raise ProcessError(
+            f"No sagsbehandler named {_SAGSBEHANDLER_NAVN!r} in the "
+            "Sagsbehandler table. That table holds real staff and is not "
+            "seeded, so it has to be populated before a conversion runs."
+        )
 
     # Plain name → id map for the DB hjemmel table
     hjemmel_map = _build_lookup_map(hjemler, name_key="label", id_key="id")
@@ -308,9 +331,6 @@ def create_bevilling(
         hjemmel_entry = _HJEMMEL_MAPPING.get(raw_hjemmel)
         hjemmel_id = hjemmel_map.get(hjemmel_entry["db_tekst"].lower()) if hjemmel_entry else None
         begrundelse = hjemmel_entry["begrundelse"] if hjemmel_entry else None
-
-        raw_sagsbehandler = (bevilling.get("Sagsbehandler") or "").strip().lower()
-        sagsbehandler_id = sagsbehandler_map.get(raw_sagsbehandler)
 
         revurderingsdato = _parse_date(bevilling.get("Revurdering"))
 

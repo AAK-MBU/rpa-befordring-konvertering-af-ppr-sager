@@ -61,6 +61,7 @@ Every call authenticates with `X-API-Key` from `API_KEY`.
 | `SkoleID` | `matrikel_id` | `/lookup/skolematrikel` returns `skolekode` specifically so this bot can build the map without a second query |
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING`, a hardcoded dict of the three values the legacy data actually contains |
 | `Revurdering` | `revurderingsdato` | a **past** date is nulled out, so a converted bevilling is not immediately flagged for re-review |
+| *(not used)* | `sagsbehandler_id` | hardcoded to `_SAGSBEHANDLER_NAVN` — see below. The source `Sagsbehandler` column is **discarded** |
 | `CaseID` | `esdh_noegle` | the PPR case id. The borgersag flow this bot once had was scrapped, so there is no separate ESDH case to resolve — the source case id is the reference. Also half of the de-duplication key |
 
 ## Environment variables (`.env`)
@@ -151,6 +152,29 @@ same bevilling, with `Alle` weekdays on each. That is wrong in detail but
 right in substance, and a caseworker narrowing the days later replaces `Alle`
 rather than adding to it. Fixing it automatically would mean inventing
 weekday splits the source never recorded.
+
+### Caseworker assignment
+
+Every converted bevilling is assigned to one caseworker, `_SAGSBEHANDLER_NAVN`
+(currently `"Sofie"`). The source `Sagsbehandler` column is discarded.
+
+`BefordringsData` does name a caseworker, but those are legacy PPR staff and
+do not line up with the `Sagsbehandler` table — which is not seeded reference
+data but real people, created and retired as staff change. Matching on the old
+names would leave most converted bevillinger with no caseworker at all, and
+occasionally attach one to somebody who has left.
+
+A single known owner is more useful: every converted bevilling is
+identifiable and reassignable in one go afterwards.
+
+Resolved once at startup and failing with a clear message if that name is not
+in the table — `Sagsbehandler` is not populated by `seed_lookup_data.sql`, so
+a fresh database has none until someone adds them.
+
+**The legacy caseworker name is lost.** There is no free-text field on
+Bevilling to park it in; `begrundelse_fra_formular` already carries the
+hjemmel begrundelse. If it needs keeping, that is a schema question to settle
+before the conversion runs, not after.
 
 ### Students are never created here
 
