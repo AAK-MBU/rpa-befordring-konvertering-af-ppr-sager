@@ -384,10 +384,24 @@ def _resolve_adresse_ids(
         source = list(key)
         candidates: list[dict] = []
 
+        # Always sent with the search. Adresse is the whole of Denmark — the
+        # nightly import reads AdresseDkGeoView with no municipality filter —
+        # and the search orders alphabetically, which on a string whose next
+        # characters are the postcode means the HIGHEST postcodes fall off the
+        # end of the limit first. Without this, "Bøgebakken 2," comes back as
+        # Greve, Roskilde and Køge, and 8462 Harlev J is never seen.
+        # None rather than "" when absent: requests omits a None param, while an
+        # empty string would be sent and rejected by the endpoint.
+        postnummer = _postcode_of(source) or None
+
         for prefix in _search_prefixes(source):
             response = requests.get(
                 f"{api_endpoint}/adresse/search",
-                params={"q": prefix},
+                # limit well above the endpoint's combobox default: a single
+                # large block of flats can exceed 15 on the street-only
+                # prefix, and a truncated result looks like an absent address
+                # rather than an ambiguous one.
+                params={"q": prefix, "postnummer": postnummer, "limit": 200},
                 headers=headers,
                 timeout=30,
             )

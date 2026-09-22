@@ -328,6 +328,14 @@ A source with no floor/door still matches every flat at that number, which is co
 
 The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
 
+### The search must be narrowed to the postcode
+
+`Adresse` is the whole of Denmark — the nightly import reads `LOIS.DAR.AdresseDkGeoView` with no municipality filter, ~4M rows. `/adresse/search` orders alphabetically, and on a string whose next characters are the postcode that means the rows falling off the end of the limit are the ones with the **highest** postcodes. Searching `"Bøgebakken 2,"` returns Greve, Roskilde and Køge, and `8462 Harlev J` is never seen.
+
+So every search sends `postnummer` (from the source address itself) and `limit=200`. The postcode filter is a contains match, but it runs on top of the prefix index seek, so it only touches rows already narrowed to. The raised limit covers the other truncation cause — a single block of flats can exceed 15 on the street-only prefix, and a truncated result looks like an *absent* address rather than an ambiguous one.
+
+A human in the combobox notices a missing address and types more. A robot records "no match" and moves on, which is why this was invisible until the addresses were listed side by side.
+
 ### The source sometimes mis-punctuates the postcode
 
 ```
