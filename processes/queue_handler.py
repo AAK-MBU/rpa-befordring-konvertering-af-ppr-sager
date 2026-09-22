@@ -607,7 +607,7 @@ def retrieve_items_for_queue() -> list[dict]:
     # 🧪 TEST MODE: TOP (30) limits the run to a small batch of cases for
     # address-resolution and data-insertion testing.
     query = """
-        SELECT TOP (100)
+        SELECT TOP (500)
             [CaseDBID], [CaseID], [CPR], [Title], [Created], [CreationDate],
             [Author], [Modified], [ModifiedDate], [Editor], [Sagsbehandler],
             [Loadtime], [BevillingFra], [BevillingTil], [Revurdering],
