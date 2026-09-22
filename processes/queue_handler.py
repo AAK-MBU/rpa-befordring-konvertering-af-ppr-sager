@@ -261,6 +261,70 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
     return resolved
 
 
+# Places whose appearance in ElevensAdresse or SkoleNavnBefordring means the
+# row is really about club transport — see _klub_note.
+_KLUB_MARKERS: tuple[str, ...] = (
+    "Klubben Holme Søndergård",
+)
+
+
+def _fold(value: str | None) -> str:
+    """Casefold, strip spaces, and flatten æ/ø/å for a tolerant contains-match.
+
+    "Søndergård" and "Søndergaard" are the same place written two ways, and
+    the source spells it both. Folding both sides means the marker matches
+    either without listing every spelling.
+    """
+
+    folded = "".join(str(value or "").split()).casefold()
+
+    for special, plain in (("æ", "ae"), ("ø", "oe"), ("å", "aa")):
+        folded = folded.replace(special, plain)
+
+    return folded
+
+
+def _klub_note(row: dict) -> str | None:
+    """A note preserving the raw address and school, when a row means "klub".
+
+    Befordring to and from a klub does not exist in the old system, but does
+    here. To record it anyway, caseworkers put the klub in ElevensAdresse and
+    the student's home in SkoleNavnBefordring — or the reverse for the return
+    trip. The row therefore describes a journey its own columns misname, and
+    no automatic conversion can recover which was which.
+
+    So the values are carried across verbatim in the kørselsrække's comment.
+    A caseworker reading it can see what the row actually said and rebuild the
+    klub kørsel properly; without it, the only trace is a bevilling whose
+    address looks wrong.
+    """
+
+    adresse = row.get("ElevensAdresse")
+    skole = row.get("SkoleNavnBefordring")
+
+    haystack = _fold(adresse) + "\x00" + _fold(skole)
+
+    if not any(_fold(marker) in haystack for marker in _KLUB_MARKERS):
+        return None
+
+    return (
+        "Fra foranstaltningsdata konvertering:\n"
+        f"ElevensAdresse: {str(adresse or '').strip()}\n"
+        f"SkoleNavnBefordring: {str(skole or '').strip()}"
+    )
+
+
+def _extend_kommentar(kommentar: str | None, note: str | None) -> str | None:
+    """Append a note to a comment, keeping whichever of the two exists."""
+
+    existing = str(kommentar or "").strip()
+
+    if not note:
+        return existing or None
+
+    return f"{existing}\n\n{note}" if existing else note
+
+
 def _one_month_on(day: date) -> date:
     """The same day one month later, clamped to the end of a shorter month."""
 
@@ -405,6 +469,7 @@ def retrieve_items_for_queue() -> list[dict]:
 
     items = []
     ambiguous_cases: list[str] = []
+    klub_rows = 0
 
     # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
     # The query orders by CaseID alone, which left the inner grouping at the
@@ -441,11 +506,28 @@ def retrieve_items_for_queue() -> list[dict]:
                 if col not in _KOERSELSRAEKKE_FIELDS
             }
 
-            # Kørselsrække-level fields — one entry per row
-            koerselsraekker = [
-                {col: _serialize(val) for col, val in row.items() if col in _KOERSELSRAEKKE_FIELDS}
-                for row in bev_rows
-            ]
+            # Kørselsrække-level fields — one entry per row.
+            #
+            # The comment is extended per ROW, not per bevilling: the klub
+            # marker sits on the individual row, and it is that row's journey
+            # the note describes.
+            koerselsraekker = []
+
+            for row in bev_rows:
+                koersel = {
+                    col: _serialize(val)
+                    for col, val in row.items()
+                    if col in _KOERSELSRAEKKE_FIELDS
+                }
+
+                note = _klub_note(row)
+
+                if note:
+                    klub_rows += 1
+
+                koersel["Kommentar"] = _extend_kommentar(koersel.get("Kommentar"), note)
+
+                koerselsraekker.append(koersel)
 
             # The address belongs to the bevilling, not the case: a student
             # who moved has older bevillinger at the previous address, and
@@ -525,6 +607,16 @@ def retrieve_items_for_queue() -> list[dict]:
         "Grouped into %d queue item(s) by PPR case ID.\n",
         len(items),
     )
+
+    if klub_rows:
+        logger.info(
+            "%d kørselsrække(r) mention a klub in ElevensAdresse or "
+            "SkoleNavnBefordring. The old system had no klub kørsel, so those "
+            "columns were used to stand in for it — the raw values are "
+            "carried across in the comment for a caseworker to rebuild "
+            "from.\n",
+            klub_rows,
+        )
 
     if ambiguous_cases:
         logger.warning(

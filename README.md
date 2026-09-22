@@ -65,6 +65,7 @@ Alle kald autentificeres med `X-API-Key`.
 | `SkoleID` | `matrikel_id` | `/lookup/skolematrikel` returnerer `skolekode`, netop så denne robot kan bygge opslaget uden en ekstra forespørgsel |
 | `HjemmelForBevilling` | `hjemmel_id` + `begrundelse_fra_formular` | `_HJEMMEL_MAPPING` — de tre værdier, de gamle data faktisk indeholder |
 | alle opslagsværdier | — | matches med al whitespace fjernet: kilden skriver `Egenbefordring`, hvor tabellen har `Egen befordring`. Kontrolleret, at ingen to værdier i nogen opslagstabel falder sammen, når mellemrum fjernes. Matcher en værdi først efter normalisering, logges begge stavemåder |
+| `ElevensAdresse` / `SkoleNavnBefordring` | kørselsrækkens `kommentar` | nævner en af dem en klub (`_KLUB_MARKERS`), tilføjes de rå værdier til kommentaren. Det gamle system havde ikke klubkørsel, så felterne blev brugt som erstatning — kun de oprindelige værdier viser, hvad rækken egentlig dækkede |
 | `BevillingAfKoerselstype` | `befordringstype_id` + `tillaeg_ids` | kilden slår de to sammen: `Rutekørsel fast forsæde` bliver til kørselstypen `Rutekørsel` og tillægget `Fast forsæde`. Direkte match forsøges først, så en almindelig kørselstype aldrig deles ved en fejl |
 | `TidspunktForBevilling` | `tidspunkt_id` **og** `rutetype_id` | samme kolonne styrer begge: Morgen → Hjem til skole, Eftermiddag → Skole til hjem, Morgen og eftermiddag → Mellem hjem og skole |
 | `Revurdering` | `revurderingsdato` | en dato i fortiden nulstilles, så en konverteret bevilling ikke straks markeres til revurdering |

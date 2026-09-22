@@ -221,6 +221,38 @@ always did.
 A split is logged, naming what came out of it, since the source string no
 longer appears anywhere in the result.
 
+### Klub rows are flagged in the comment, not converted
+
+Befordring to and from a klub does not exist in the old system but does here.
+To record it anyway, caseworkers put the klub in `ElevensAdresse` and the
+student's home in `SkoleNavnBefordring` — or the reverse, for the return trip.
+The row therefore describes a journey its own columns misname, and nothing
+automatic can recover which was which.
+
+So the raw values are carried across verbatim, appended to that kørselsrække's
+comment:
+
+```
+Fra foranstaltningsdata konvertering:
+ElevensAdresse: Klubben Holme Søndergård, 8270 Højbjerg
+SkoleNavnBefordring: Kærlundvej 16, 8260 Viby J
+```
+
+An existing comment is kept and the note added below it. Detection is per
+**row**, not per bevilling — the marker sits on the individual row, and it is
+that row's journey the note describes.
+
+`_KLUB_MARKERS` holds the places to look for, currently just
+`"Klubben Holme Søndergård"`. Matching goes through `_fold()`, which casefolds,
+strips spaces and flattens æ/ø/å, so `"Søndergaard"` and `"Søndergård"` both
+match without listing every spelling. Add a marker to the tuple as more turn
+up.
+
+The queue phase reports how many rows were flagged, so the size of the manual
+follow-up is known before anything is converted. Note the bevilling itself
+still converts with whatever address those columns produced — the note is what
+tells a caseworker to rebuild the klub kørsel properly.
+
 ### Caseworker assignment
 
 Every converted bevilling is assigned to one caseworker, `_SAGSBEHANDLER_NAVN`
