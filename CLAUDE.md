@@ -328,6 +328,15 @@ A source with no floor/door still matches every flat at that number, which is co
 
 The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
 
+### The source sometimes mis-punctuates the postcode
+
+```
+Rosenhøj Bakke 20, 3. tv.  8260 Viby J
+                        ^ a period where a comma belongs
+```
+
+Splitting on commas alone leaves `3. tv. 8260 viby j` as one part, which then has to turn up among the register's middle parts — it never will — and with no postcode at its head `_address_key` drops the address outright. A four-digit postcode followed by a town is unmistakable wherever it sits, so `_components` splits the last part there and trims the stray period. Only the last part, and only when it does not already begin with a postcode, so nothing correctly written is touched.
+
 ### Punctuation differs between the two systems
 
 The same address is punctuated differently on each side, and the differences are purely typographic:
@@ -353,6 +362,14 @@ Kø-emne 1 | PPR-sag PPR-1 | CPR 0101011234 | 1 bevilling(er)
 ```
 
 Both sides are printed because the two systems punctuate the same address differently: a match that looks wrong at a glance usually is not, and one that genuinely is wrong is only visible with the source beside it. Per item rather than as one table at the end, so it reads in the order the queue was built.
+
+An unresolved address logs the searches that came back empty, so the prefix can be pasted straight into the address field to see what the register actually has. Where the text contains a character a Danish address is not written with, it also logs a repr — a zero-width space, a soft hyphen, an en-dash or a decomposed `å` breaks matching while looking perfectly normal on screen, and `0 candidate(s)` on its own is not diagnosable:
+
+```
+  rosen​høj bakke 20, 3. tv, 8260 viby j — 0 candidate(s)
+      søgte på: rosen​høj bakke 20, 3. tv, | rosen​høj bakke 20, 3 tv, | rosen​høj bakke 20,
+      tegn:     'rosen\u200bh\xf8j bakke 20, 3. tv, 8260 viby j'
+```
 
 The floor variants exist purely for the 15-row cap. The street-only fallback would find these buildings anyway, but a block with more than 15 flats pushes the wanted row out of the results, where it looks absent rather than ambiguous.
 

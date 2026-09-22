@@ -48,19 +48,57 @@ _KOERSELSRAEKKE_FIELDS = {
 
 _POSTCODE = re.compile(r"^(\d{4})\b")
 
+# A four-digit postcode and town sitting at the END of a part that does not
+# start with one — i.e. a postcode the source failed to put after a comma.
+# Requires a town after the digits, so a four-digit house number is not
+# mistaken for a postcode.
+_EMBEDDED_POSTCODE = re.compile(r"^(.*\S)\s*[.,]?\s+(\d{4}\s+\S.*)$")
+
+# Anything outside the characters a Danish address is actually written with.
+# Used only to decide whether an unresolved address should be logged as a
+# repr as well: a zero-width space, a soft hyphen or a decomposed "å" makes a
+# string that cannot be matched and cannot be seen either, and printing the
+# text alone leaves nothing to go on.
+_SUSPECT_CHARS = re.compile(r"[^\w\s,.\-/]", re.UNICODE)
+
 
 def _components(tekst: str | None) -> list[str]:
     """Split an address into normalised comma-separated parts.
 
     Whitespace runs are collapsed and everything is casefolded, so
     "Kærlundvej  16" and "KÆRLUNDVEJ 16" compare equal.
+
+    One repair is made on the way: the legacy data sometimes ends the floor
+    with a period rather than a comma —
+
+        Rosenhøj Bakke 20, 3. tv.  8260 Viby J
+                                ^ should be a comma
+
+    which leaves "3. tv. 8260 viby j" as a single part. That part then has to
+    turn up among the register's middle parts, where it never will, and with
+    no postcode at its head the address may be dropped outright. A four-digit
+    postcode followed by a town is unmistakable wherever it sits, so the part
+    is split there and the stray period trimmed.
+
+    Only the LAST part is repaired, which is where a mis-punctuated postcode
+    always lands, and only when it does not already begin with one. Nothing
+    correctly written is touched.
     """
 
-    return [
+    parts = [
         " ".join(part.split()).casefold()
         for part in str(tekst or "").split(",")
         if part.strip()
     ]
+
+    if parts and not _POSTCODE.match(parts[-1]):
+        embedded = _EMBEDDED_POSTCODE.match(parts[-1])
+
+        if embedded:
+            head = embedded.group(1).rstrip(".,").strip()
+            parts = parts[:-1] + ([head] if head else []) + [embedded.group(2)]
+
+    return parts
 
 
 def _canon(part: str | None) -> str:
@@ -273,6 +311,34 @@ def _search_prefixes(source: list[str]) -> list[str]:
     return _dedupe(prefixes)
 
 
+def _unresolved_line(key: tuple[str, ...], count: int, prefixes: list[str]) -> str:
+    """One line per address that could not be resolved, with enough to act on.
+
+    Three things, because "0 candidate(s)" on its own is not diagnosable:
+
+      the address        as the matcher normalised it
+      the prefixes tried the exact searches that came back empty, which can be
+                         pasted straight into the address field to see what the
+                         register does have
+      a repr             ONLY when the text contains a character a Danish
+                         address is not written with. A zero-width space, a
+                         soft hyphen or an NFD "å" breaks matching while
+                         looking perfectly normal on screen, and without the
+                         repr there is nothing to see.
+    """
+
+    tekst = ", ".join(key)
+    line = f"  {tekst} — {count} candidate(s)"
+
+    if count == 0:
+        line += f"\n      søgte på: {' | '.join(prefixes)}"
+
+    if _SUSPECT_CHARS.search(tekst):
+        line += f"\n      tegn:     {tekst!a}"
+
+    return line
+
+
 def _resolve_adresse_ids(
     rows: list[dict],
 ) -> tuple[dict[tuple[str, ...], str], dict[str, str]]:
@@ -312,7 +378,7 @@ def _resolve_adresse_ids(
     # adresse_id -> the register's own spelling, so the queue log can show what
     # each source address actually matched rather than a bare GUID.
     tekster: dict[str, str] = {}
-    unresolved: list[tuple[tuple[str, ...], int]] = []
+    unresolved: list[tuple[tuple[str, ...], int, list[str]]] = []
 
     for key in sorted(keys):
         source = list(key)
@@ -346,7 +412,7 @@ def _resolve_adresse_ids(
             tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
             continue
 
-        unresolved.append((key, len(candidates)))
+        unresolved.append((key, len(candidates), _search_prefixes(source)))
 
     logger.info(
         "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
@@ -359,10 +425,8 @@ def _resolve_adresse_ids(
             "%d address(es) unresolved — the bevillinger using them will be "
             "rejected for manual follow-up:\n%s\n",
             len(unresolved),
-            "\n".join(
-                f"  {', '.join(key)} — {count} candidate(s)"
-                for key, count in unresolved
-            ),
+            "\n".join(_unresolved_line(key, count, prefixes)
+                      for key, count, prefixes in unresolved),
         )
 
     return resolved, tekster
