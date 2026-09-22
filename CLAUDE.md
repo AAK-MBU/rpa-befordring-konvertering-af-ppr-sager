@@ -34,7 +34,16 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 1. Reads `BefordringsData` from the RPA database (connection string from `RPAConnection(db_env="PROD").get_constant("DbConnectionString")`).
 2. Resolves the address **each bevilling was granted against** to an `adresse_id`, via `/adresse/search` against the befordring application's own `Adresse` table. That table is a full copy of the municipality's register, refreshed nightly by `rpa-befordring-nightly-runs`, so this bot no longer reaches into LOIS and the conversion is API-only.
 
-   Note this is *not* the student's current address — that already sits on `Elev`, put there by the nightly run, and nothing here looks it up. `Bevilling.adresse_id` records where a given bevilling was granted, which is what `adresse_mismatch` later compares against the student's own. A student who moved has older bevillinger at the previous address, so it is resolved **per bevilling**, not per case.
+   `Bevilling.adresse_id` records where a given bevilling was granted, which is what `adresse_mismatch` later compares against the student's own. A student who moved has older bevillinger at the previous address, so it is resolved **per bevilling**, not per case.
+
+   **Rows inside one bevilling can disagree**, and often do: a klub row names the klub where the others name the home, and a bucket spanning a move holds the old address and the new one. `queue_handler` therefore passes *every* distinct address the bucket's rows resolved to, in row order, as `adresse_id_kandidater`; `bevilling_creation` makes the choice, because only it has the `Elev` record.
+
+   The rule is that the student's own address decides:
+
+   - **Any candidate equals `Elev.adresse_id`** → that one goes on the bevilling. The data is right and the status engine leaves it alone.
+   - **None does** → the first resolving row is kept. It will not equal `Elev.adresse_id`, so `usp_recalculate_bevilling_status` computes `adresse_mismatch = 1` and raises genbehandling **by itself**. Nothing forces the flag: a wrong address *is* the mismatch it looks for, which is why this needed no schema change.
+
+   The student's current address comes from `view_Stamdata`, which the bot already calls to check the student exists. The view had to expose `e.adresse_id` for this (`adresse_tekst` alone cannot be compared — two identical strings are not a match). The rows not chosen are not lost: each is still its own kørselsrække, and a klub row carries its raw values in its comment.
 
    `Bevilling.adresse_id` is `NOT NULL`, so a bevilling whose address cannot be matched cannot be created. `process_item` rejects the whole case in that event rather than converting it partially — a case missing one of its bevillinger looks complete to a caseworker and is harder to spot than one that never arrived.
 3. Groups rows into **one queue item per PPR case**, referenced by `CaseID`, so re-running `--queue` cannot duplicate.

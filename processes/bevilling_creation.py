@@ -412,7 +412,9 @@ def create_bevilling(
             f"{stamdata_response.status_code} — {stamdata_response.text}"
         )
 
-    if stamdata_response.json() is None:
+    stamdata = stamdata_response.json()
+
+    if stamdata is None:
         # Every currently enrolled student is already in Elev: the nightly run
         # (rpa-befordring-nightly-runs) upserts the whole student dump from
         # Elev_STG before this conversion ever runs. A miss therefore means the
@@ -439,7 +441,17 @@ def create_bevilling(
             "before the bevilling can be converted."
         )
 
-    logger.info("Student %s exists in Elev.\n", person_ssn)
+    # Where the student lives now, per the nightly Elev load. Every converted
+    # bevilling's address is checked against this — see the candidate pick in
+    # the loop below. None when the nightly run has not resolved an address for
+    # them yet, which switches the check off rather than failing the case.
+    elev_adresse_id = stamdata.get("adresse_id")
+
+    logger.info(
+        "Student %s exists in Elev. Current adresse_id: %s\n",
+        person_ssn,
+        elev_adresse_id or "(ingen)",
+    )
 
     # --- Fetch existing bevillinger for this student to avoid duplicates ---
     # Keyed on (esdh_noegle, foerste_koersel_dato), not esdh_noegle alone.
@@ -528,6 +540,43 @@ def create_bevilling(
                 len(bevillinger),
                 person_ssn,
                 existing_id,
+            )
+
+        # --- Which of the bevilling's addresses goes on it ---
+        #
+        # queue_handler passes every distinct address the bucket's rows
+        # resolved to, in row order. They disagree more often than they look
+        # like they should: a klub row names the klub rather than the home, and
+        # a bucket spanning a move holds both the old address and the new one.
+        #
+        # The rule is the student's own address decides. If any row resolved to
+        # where they live now, that is the bevilling's address — the data is
+        # correct and the status engine leaves it alone. If none did, the first
+        # resolving row is kept, it will not equal Elev.adresse_id, and
+        # usp_recalculate_bevilling_status raises genbehandling by itself.
+        # Nothing has to force that flag: a wrong address IS the mismatch it
+        # looks for.
+        #
+        # The other rows are not lost — each is its own kørselsrække, and a
+        # klub row carries its raw values in its comment.
+        kandidater = bevilling.get("adresse_id_kandidater") or []
+        adresse_id = bevilling.get("adresse_id")
+
+        if elev_adresse_id and elev_adresse_id in kandidater:
+            adresse_id = elev_adresse_id
+
+        if len(kandidater) > 1:
+            logger.info(
+                "  Bevilling %d/%d: kørselsrækkerne peger på %d forskellige "
+                "adresser (%s). Valgt: %s (%s).\n",
+                i,
+                len(bevillinger),
+                len(kandidater),
+                ", ".join(str(k) for k in kandidater),
+                adresse_id,
+                "elevens egen adresse"
+                if adresse_id == elev_adresse_id
+                else "ingen af dem matcher elevens adresse — går til genbehandling",
             )
 
         # --- Resolve bevilling-level lookup IDs ---
@@ -637,7 +686,7 @@ def create_bevilling(
             # Per bevilling, not per case: a student who moved has older
             # bevillinger at the previous address. process_item has already
             # rejected the case if any of these is missing.
-            "adresse_id": bevilling.get("adresse_id"),
+            "adresse_id": adresse_id,
             "matrikel_id": matrikel_id,
             "hjemmel_id": hjemmel_id,
             "sagsbehandler_id": sagsbehandler_id,

@@ -27,7 +27,16 @@ Faserne er uafhængige og kan kombineres.
 1. Læser `BefordringsData` fra RPA-databasen (forbindelsen hentes fra `RPAConnection`).
 2. Slår op, hvilken adresse **hver bevilling er givet på**, i befordringsapplikationens egen `Adresse`-tabel via `/adresse/search`. Den tabel er en fuld kopi af kommunens adresseregister, som `rpa-befordring-nightly-runs` opdaterer hver nat — så robotten henter ikke længere selv fra LOIS, og hele konverteringen går gennem ét API.
 
-   Det er ikke elevens nuværende adresse: den ligger allerede på `Elev` fra nattekørslen. `Bevilling.adresse_id` fortæller, hvor den enkelte bevilling blev givet, og en elev, der er flyttet, har ældre bevillinger på den gamle adresse — derfor slås den op pr. bevilling og ikke pr. sag.
+   `Bevilling.adresse_id` fortæller, hvor den enkelte bevilling blev givet, og en elev, der er flyttet, har ældre bevillinger på den gamle adresse — derfor slås den op pr. bevilling og ikke pr. sag.
+
+   **Rækkerne i én bevilling kan være uenige:** en klubrække har klubben stående, hvor de andre har hjemmet, og en bevilling, der spænder over en flytning, har både den gamle og den nye adresse. Derfor sendes alle de adresser, rækkerne slog op, videre som `adresse_id_kandidater`, og valget træffes i `bevilling_creation`, som er det eneste sted med elevens egne data.
+
+   Elevens egen adresse afgør:
+
+   - **Matcher en af kandidaterne `Elev.adresse_id`** → den kommer på bevillingen. Data er korrekte, og statusmotoren rører den ikke.
+   - **Matcher ingen** → første opslåede adresse beholdes. Den er forskellig fra elevens, så `usp_recalculate_bevilling_status` sætter `adresse_mismatch = 1` og sender bevillingen til **genbehandling af sig selv** — flaget skal ikke tvinges, for en forkert adresse *er* netop den uoverensstemmelse, den leder efter.
+
+   De fravalgte rækker går ikke tabt: hver er stadig sin egen kørselsrække, og en klubrække bærer sine rå værdier med i kommentaren.
 
    `Bevilling.adresse_id` er `NOT NULL`, så en bevilling uden match kan ikke oprettes. `process_item` afviser hele sagen i det tilfælde frem for at konvertere den delvist.
 3. Danner **ét kø-item pr. PPR-sag** med `CaseID` som reference, så `--queue` kan køres igen uden at skabe dubletter.

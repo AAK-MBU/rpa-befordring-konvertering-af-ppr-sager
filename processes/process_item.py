@@ -21,6 +21,13 @@ def process_item(item_data: dict, item_reference: str):
                                        bevilling-level fields
                                        adresse_id (str | None), resolved at
                                          queue time against the Adresse table
+                                       adresse_id_kandidater (list[str]), every
+                                         distinct address the bucket's rows
+                                         resolved to, in row order.
+                                         bevilling_creation picks the one
+                                         matching the student's own address;
+                                         adresse_id is the fallback and what
+                                         the check below tests.
                                        koerselsraekker (list[dict])
     """
 

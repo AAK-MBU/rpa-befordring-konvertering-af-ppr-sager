@@ -534,15 +534,33 @@ def retrieve_items_for_queue() -> list[dict]:
             # Bevilling.adresse_id is meant to record where each one was
             # granted. Resolved per bevilling for that reason.
             #
-            # Rows within one bevilling can still disagree, so take the first
-            # that resolves rather than trusting row zero.
-            bevilling_adresse_id = next(
-                (
-                    adresse_ids[key]
-                    for key in (_address_key(row) for row in bev_rows)
-                    if key and key in adresse_ids
-                ),
-                None,
+            # Rows within one bevilling can disagree — a klub row names the
+            # klub where the others name the home, and a bucket spanning a move
+            # holds both addresses. Which one belongs on the bevilling cannot be
+            # decided here: it depends on where the student lives NOW, and only
+            # bevilling_creation has the Elev record. So every distinct address
+            # the rows resolve to is passed on, in row order, and the choice is
+            # made there.
+            bevilling_adresse_kandidater = []
+
+            for row in bev_rows:
+                key = _address_key(row)
+
+                if not key or key not in adresse_ids:
+                    continue
+
+                kandidat = adresse_ids[key]
+
+                if kandidat not in bevilling_adresse_kandidater:
+                    bevilling_adresse_kandidater.append(kandidat)
+
+            # The fallback, and what process_item checks to reject a case whose
+            # address could not be matched at all. bevilling_creation overrides
+            # it with whichever candidate matches the student's own address.
+            bevilling_adresse_id = (
+                bevilling_adresse_kandidater[0]
+                if bevilling_adresse_kandidater
+                else None
             )
 
             # The earliest date the bevilling's kørsel starts. Two jobs:
@@ -572,6 +590,7 @@ def retrieve_items_for_queue() -> list[dict]:
             bevillinger.append({
                 **bevilling_data,
                 "adresse_id": bevilling_adresse_id,
+                "adresse_id_kandidater": bevilling_adresse_kandidater,
                 "bucket": bev_key[0],
                 "foerste_koersel_dato": foerste_koersel_dato,
                 "sagsbehandlingsdato": sagsbehandlingsdato,
