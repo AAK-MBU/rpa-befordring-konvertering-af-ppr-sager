@@ -2,16 +2,12 @@
 This module provides helper functions.
 """
 
-import json
 import os
 import re
-from io import BytesIO
 from typing import Dict, List, Union
 from urllib.parse import unquote, urlparse
 
 import pyodbc
-from mbu_dev_shared_components.database import constants
-from mbu_dev_shared_components.database.connection import RPAConnection
 
 
 def _is_url(string: str) -> bool:
@@ -281,140 +277,3 @@ def fetch_cases_metadata(connection_string) -> Dict | None:
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
-
-
-def notify_stakeholders(
-    case_metadata,
-    case_id,
-    case_title,
-    case_rel_url,
-    error_message,
-    attachment_bytes,
-    form=None,
-    db_env="PROD",
-):
-    """Notify stakeholders about the journalized case."""
-    try:
-        if form is None:
-            form = {}
-        form_type = case_metadata["os2formwebform_id"]
-        process_name = case_metadata.get("description")
-        with RPAConnection(db_env=db_env) as rpa_conn:
-            email_sender = rpa_conn.get_constant("e-mail_noreply")["value"]
-        email_subject = None
-        email_body = None
-        email_recipient = None
-        caseid = case_id if case_id else "Ukendt"
-        casetitle = case_title if case_title else "Ukendt"
-        case_url = (
-            ("https://go.aarhuskommune.dk" + case_rel_url) if case_rel_url else None
-        )
-
-        case_data = json.loads(case_metadata.get("caseData", "{}"))
-        email_recipient = case_data.get("emailRecipient")
-        email_subject = f"Ny sag er blevet journaliseret: {process_name}"
-        email_body = (
-            f"<p>Vi vil informere dig om, at en ny sag er blevet journaliseret.</p>"
-            f"<p>"
-            f"<strong>Sagsid:</strong> {caseid}<br>"
-            f"<strong>Sagstitel:</strong> {casetitle}"
-            f"<p>Link til sagen <a href={case_url}>her</a>"
-            f"</p>"
-        )
-
-        if error_message:
-            critical = form_type in (
-                "indmeld_kraenkelser_af_boern",
-                "respekt_for_graenser_privat",
-                "respekt_for_graenser",
-            )
-            with RPAConnection(db_env=db_env) as rpa_conn:
-                email_recipient = rpa_conn.get_constant("Error Email")["value"]
-            email_subject = "Fejl ved journalisering af sag"
-            email_body = (
-                f"<p>Der opstod en fejl ved journalisering af en sag.</p>"
-                f"<p>"
-                f"<strong>Form type:</strong> {form_type}<br>"
-                f"<strong>Process navn:</strong> {process_name}<br>"
-                f"<strong>Form id:</strong> {form.get('form_id')}<br>"
-                f"<strong>Form submitted date:</strong> {form.get('form_submitted_date')}<br>"
-                f"<strong>Sagsid:</strong> {caseid}<br>"
-                f"<strong>Sagstitel:</strong> {casetitle}<br>"
-                f"<strong>Fejlbesked:</strong> {error_message}"
-                f"</p>"
-            )
-            if critical:
-                with RPAConnection(db_env=db_env) as rpa_conn:
-                    rpa_team_email = rpa_conn.get_constant("rpa_team_email")["value"]
-                rpa_team_email_list = json.loads(rpa_team_email)
-                email_recipient = [email_recipient]
-                email_recipient.extend(rpa_team_email_list)
-                email_subject = "!!KRITISK!!! Fejl ved journalisering af sag"
-
-        elif form_type in (
-            "indmeld_kraenkelser_af_boern",
-            "respekt_for_graenser_privat",
-            "respekt_for_graenser",
-        ):
-            email_subject = "Ny sag er blevet journaliseret: Respekt For Grænser"
-
-        attachments = []
-        if attachment_bytes and form_type not in [
-            "pasningstid",
-            "anmeldelse_af_hjemmeundervisning",
-        ]:
-            attachment_file = BytesIO(attachment_bytes)
-            attachments.append(
-                smtp_util.EmailAttachment(
-                    file=attachment_file, file_name=f"journalisering_{caseid}.pdf"
-                )
-            )
-
-        if email_recipient is not None:
-            with RPAConnection(db_env=db_env) as rpa_conn:
-                smtp_server = rpa_conn.get_constant("smtp_server")["value"]
-                smtp_port = rpa_conn.get_constant("smtp_port")["value"]
-            smtp_util.send_email(
-                receiver=email_recipient,
-                sender=email_sender,
-                subject=email_subject,
-                body=email_body,
-                html_body=email_body,
-                smtp_server=smtp_server,
-                smtp_port=smtp_port,
-                attachments=attachments if attachments else None,
-            )
-            if error_message:
-                with RPAConnection(db_env=db_env, commit=True) as rpa_conn:
-                    rpa_conn.log_event(
-                        log_db=LOG_DB,
-                        level="INFO",
-                        message="Error email sent",
-                        context=f"{LOG_CONTEXT} ({process_name})",
-                    )
-            else:
-                with RPAConnection(db_env=db_env, commit=True) as rpa_conn:
-                    rpa_conn.log_event(
-                        log_db=LOG_DB,
-                        level="INFO",
-                        message="Notification sent to stakeholder",
-                        context=f"{LOG_CONTEXT} ({process_name})",
-                    )
-        else:
-            with RPAConnection(db_env=db_env, commit=True) as rpa_conn:
-                rpa_conn.log_event(
-                    log_db=LOG_DB,
-                    level="ERROR",
-                    message="Stakeholders not notified. No recipient found for notification",
-                    context=f"{LOG_CONTEXT} ({process_name})",
-                )
-
-    except Exception as e:
-        with RPAConnection(db_env=db_env, commit=True) as rpa_conn:
-            rpa_conn.log_event(
-                log_db=LOG_DB,
-                level="ERROR",
-                message=f"Error sending notification mail, {case_id}: {e}",
-                context=f"{LOG_CONTEXT}, ({process_name})",
-            )
-        print(f"Error sending notification mail, {case_id}: {e}")

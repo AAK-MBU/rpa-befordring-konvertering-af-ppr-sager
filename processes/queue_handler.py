@@ -63,6 +63,32 @@ def _components(tekst: str | None) -> list[str]:
     ]
 
 
+def _canon(part: str | None) -> str:
+    """Canonical form of ONE address component, for comparison only.
+
+    The two systems punctuate the same address differently, and every
+    difference seen so far is purely typographic:
+
+        floor and door   BefordringsData  "1 th"     Adresse  "1. th"
+        house number     BefordringsData  "31 c"     Adresse  "31C"
+
+    Dropping every period and every space collapses both pairs onto one
+    string ("1th", "31c"). Deliberately blunt: classifying the parts properly
+    would mean parsing Danish address conventions, and this only has to decide
+    whether two spellings name the same place.
+
+    Blunt is safe here because ambiguity is already refused. An address is
+    accepted only when exactly ONE candidate matches, so two register rows
+    that canonicalise alike are reported as ambiguous and sent to manual
+    follow-up rather than guessed between.
+
+    NOT applied to the postcode component: _postcode_of matches on a word
+    boundary after the four digits, which stripping spaces would destroy.
+    """
+
+    return "".join(str(part or "").split()).replace(".", "")
+
+
 def _postcode_of(components: list[str]) -> str:
     """The four-digit postcode from the last component, or ''."""
 
@@ -109,16 +135,17 @@ def _matches(candidate_tekst: str | None, source: list[str]) -> bool:
     if len(candidate) < 2 or len(source) < 2:
         return False
 
-    if candidate[0] != source[0]:
+    if _canon(candidate[0]) != _canon(source[0]):
         return False
 
+    # On the raw components: _postcode_of needs the space after the digits.
     if _postcode_of(candidate) != _postcode_of(source):
         return False
 
     # Every middle part of the source, in order, somewhere in the candidate's.
-    remaining = iter(candidate[1:-1])
+    remaining = iter(_canon(part) for part in candidate[1:-1])
 
-    return all(part in remaining for part in source[1:-1])
+    return all(_canon(part) in remaining for part in source[1:-1])
 
 
 def _address_key(row: dict) -> tuple[str, ...] | None:
@@ -153,6 +180,64 @@ def _address_key(row: dict) -> tuple[str, ...] | None:
     return tuple(components)
 
 
+# "31 c" <-> "31c" — a house-number letter, written with or without a space.
+_HOUSE_LETTER_SPACED = re.compile(r"(\d)\s+([a-zæøå])$")
+_HOUSE_LETTER_JOINED = re.compile(r"(\d)([a-zæøå])$")
+
+# "1 th" / "1. th" / "st tv" / "st. tv" — a floor token, with or without its
+# period. kl and kld are kælder (basement).
+_FLOOR_PREFIX = re.compile(r"^(\d+|st|kl|kld)\.?\s+(.*)$")
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    """Order-preserving de-duplication."""
+
+    seen: list[str] = []
+
+    for value in values:
+        if value not in seen:
+            seen.append(value)
+
+    return seen
+
+
+def _street_variants(street: str) -> list[str]:
+    """Spellings of the street component to try against the register.
+
+    _canon makes COMPARISON tolerant of the space in a house-number letter,
+    but the search itself is a prefix LIKE against adresse_tekst, so the
+    prefix has to be spelled the way the register spells it. Both directions
+    are generated because either side may be the one with the space:
+
+        "Egå Mosevej 31 c"  ->  also try  "egå mosevej 31c"
+        "Egå Mosevej 31C"   ->  also try  "egå mosevej 31 c"
+    """
+
+    return _dedupe([
+        street,
+        _HOUSE_LETTER_SPACED.sub(r"\1\2", street),
+        _HOUSE_LETTER_JOINED.sub(r"\1 \2", street),
+    ])
+
+
+def _floor_variants(part: str) -> list[str]:
+    """Spellings of a floor/door component, with and without the period.
+
+    Only needed to keep a large building inside the 15-row search cap: the
+    street-only prefix would find it anyway, but a block with more than 15
+    flats pushes the wanted row out of the results, and it looks absent.
+    """
+
+    match = _FLOOR_PREFIX.match(part)
+
+    if not match:
+        return [part]
+
+    floor, rest = match.group(1), match.group(2)
+
+    return _dedupe([part, f"{floor}. {rest}", f"{floor} {rest}"])
+
+
 def _search_prefixes(source: list[str]) -> list[str]:
     """Search prefixes to try for an address, most selective first.
 
@@ -167,17 +252,30 @@ def _search_prefixes(source: list[str]) -> list[str]:
     pushed out of the results and look absent. The street-only prefix is kept
     as a fallback, because the register sometimes puts a supplementary place
     name where this assumes the floor is.
+
+    Each is generated for every plausible spelling of the street, and of the
+    floor, since the search cannot find what it does not spell the same way.
+    The floor+street prefixes all come before the street-only ones, so the
+    most selective search still runs first.
     """
 
-    street = source[0]
+    streets = _street_variants(source[0])
+
+    prefixes: list[str] = []
 
     if len(source) > 2:
-        return [f"{street}, {source[1]},", f"{street},"]
+        for street in streets:
+            for floor in _floor_variants(source[1]):
+                prefixes.append(f"{street}, {floor},")
 
-    return [f"{street},"]
+    prefixes.extend(f"{street}," for street in streets)
+
+    return _dedupe(prefixes)
 
 
-def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
+def _resolve_adresse_ids(
+    rows: list[dict],
+) -> tuple[dict[tuple[str, ...], str], dict[str, str]]:
     """Resolve each distinct bevilling address to an adresse_id.
 
     Resolved against the befordring application's own Adresse table, through
@@ -194,10 +292,15 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
         rows: BefordringsData rows.
 
     Returns:
-        dict mapping the address components -> adresse_id. Addresses that
-        resolve to nothing, or to more than one candidate, are omitted and
-        logged; the bevilling using them is then rejected for manual
-        follow-up, since Bevilling.adresse_id is NOT NULL.
+        (resolved, tekster) where resolved maps the address components ->
+        adresse_id, and tekster maps adresse_id -> the register's own spelling
+        of it. The second is for logging: a queue line showing what a source
+        address matched is only useful if it names the address rather than its
+        GUID.
+
+        Addresses that resolve to nothing, or to more than one candidate, are
+        omitted from both and logged; the bevilling using them is then
+        rejected for manual follow-up, since Bevilling.adresse_id is NOT NULL.
     """
 
     api_endpoint, api_key = get_api_credentials()
@@ -206,6 +309,9 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
     keys = {key for key in (_address_key(row) for row in rows) if key}
 
     resolved: dict[tuple[str, ...], str] = {}
+    # adresse_id -> the register's own spelling, so the queue log can show what
+    # each source address actually matched rather than a bare GUID.
+    tekster: dict[str, str] = {}
     unresolved: list[tuple[tuple[str, ...], int]] = []
 
     for key in sorted(keys):
@@ -237,6 +343,7 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
 
         if len(candidates) == 1:
             resolved[key] = candidates[0]["adresse_id"]
+            tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
             continue
 
         unresolved.append((key, len(candidates)))
@@ -258,7 +365,7 @@ def _resolve_adresse_ids(rows: list[dict]) -> dict[tuple[str, ...], str]:
             ),
         )
 
-    return resolved
+    return resolved, tekster
 
 
 # Places whose appearance in ElevensAdresse or SkoleNavnBefordring means the
@@ -444,7 +551,7 @@ def retrieve_items_for_queue() -> list[dict]:
     logger.info("Fetched %d row(s) from BefordringsData.\n", len(rows))
 
     # --- Resolve every distinct address up front ---
-    adresse_ids = _resolve_adresse_ids(rows)
+    adresse_ids, adresse_tekster = _resolve_adresse_ids(rows)
 
     today = date.today()
     window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
@@ -490,6 +597,8 @@ def retrieve_items_for_queue() -> list[dict]:
         case_rows = sorted(case_rows, key=lambda r: (bucket_of(r), str(r.get("CaseDBID") or "")))
 
         bevillinger = []
+        # (bucket, [(kilde, match)]) per bevilling — for the queue log below.
+        adresse_log: list[tuple[str, list[tuple[str, str | None]]]] = []
         for bev_key, bev_iter in groupby(case_rows, key=bucket_of):
             bev_rows = list(bev_iter)
             first = bev_rows[0]
@@ -543,16 +652,24 @@ def retrieve_items_for_queue() -> list[dict]:
             # made there.
             bevilling_adresse_kandidater = []
 
+            # (source address as BefordringsData wrote it, register address it
+            # matched or None) — logged per queue item so the conversion can be
+            # read back address by address. Kept out of the queue item itself:
+            # it is for the run log, and ATS does not need it.
+            adresse_opslag: list[tuple[str, str | None]] = []
+
             for row in bev_rows:
+                kilde = " ".join(str(row.get("ElevensAdresse") or "").split())
                 key = _address_key(row)
+                kandidat = adresse_ids.get(key) if key else None
 
-                if not key or key not in adresse_ids:
-                    continue
-
-                kandidat = adresse_ids[key]
-
-                if kandidat not in bevilling_adresse_kandidater:
+                if kandidat and kandidat not in bevilling_adresse_kandidater:
                     bevilling_adresse_kandidater.append(kandidat)
+
+                opslag = (kilde, adresse_tekster.get(kandidat) if kandidat else None)
+
+                if opslag not in adresse_opslag:
+                    adresse_opslag.append(opslag)
 
             # The fallback, and what process_item checks to reject a case whose
             # address could not be matched at all. bevilling_creation overrides
@@ -597,6 +714,8 @@ def retrieve_items_for_queue() -> list[dict]:
                 "koerselsraekker": koerselsraekker,
             })
 
+            adresse_log.append((bev_key[0], adresse_opslag))
+
         # (esdh_noegle, foerste_koersel_dato) is what tells one converted
         # bevilling from another on a re-run, and esdh_noegle is the same for
         # the whole case — so two buckets starting on the same day are
@@ -621,6 +740,30 @@ def retrieve_items_for_queue() -> list[dict]:
                 "bevillinger": bevillinger,
             },
         })
+
+        # Every address this item carries, as BefordringsData wrote it and as
+        # the Adresse table spells it back. The two systems punctuate the same
+        # address differently (see _canon), so a match that looks wrong at a
+        # glance usually is not — and one that IS wrong is only visible if both
+        # sides are printed side by side. Logged per item rather than as one
+        # table at the end so it reads in the same order the queue was built.
+        linjer = []
+
+        for bucket, opslag in adresse_log:
+            linjer.append(f"    [{bucket}]")
+
+            for kilde, match in opslag:
+                linjer.append(f"      kilde: {kilde or '(tom)'}")
+                linjer.append(f"      match: {match or '— INTET MATCH —'}")
+
+        logger.info(
+            "Kø-emne %d | PPR-sag %s | CPR %s | %d bevilling(er)\n%s\n",
+            len(items),
+            ppr_case_id,
+            person_ssn,
+            len(bevillinger),
+            "\n".join(linjer),
+        )
 
     logger.info(
         "Grouped into %d queue item(s) by PPR case ID.\n",

@@ -328,6 +328,34 @@ A source with no floor/door still matches every flat at that number, which is co
 
 The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
 
+### Punctuation differs between the two systems
+
+The same address is punctuated differently on each side, and the differences are purely typographic:
+
+| | BefordringsData | Adresse |
+|---|---|---|
+| floor and door | `Drosbjerg 16, 1 th` | `Drosbjerg 16, 1. th` |
+| house-number letter | `Egå Mosevej 31 c` | `Egå Mosevej 31C` |
+
+`_canon` collapses both pairs onto one string by dropping every period and every space (`1th`, `31c`). It is deliberately blunt — classifying the parts properly would mean parsing Danish address conventions, and this only has to decide whether two spellings name the same place. Blunt is safe because ambiguity is already refused: an address is accepted only when exactly **one** candidate matches, so two register rows that canonicalise alike go to manual follow-up rather than being guessed between. It is not applied to the postcode component, where `_postcode_of` needs the word boundary after the four digits.
+
+`_canon` fixes comparison, but the *search* is a prefix `LIKE` against `adresse_tekst`, so a prefix still has to be spelled the register's way. `_street_variants` and `_floor_variants` generate both spellings of each — with and without the space in a house-number letter, with and without the floor's period — and `_search_prefixes` tries them most-selective first, stopping at the first that matches. A correctly spelled address therefore still costs one request; only the awkward ones escalate.
+
+Every queue item logs its addresses as it is built — each source address as BefordringsData wrote it, and the register address it matched, or `— INTET MATCH —`:
+
+```
+Kø-emne 1 | PPR-sag PPR-1 | CPR 0101011234 | 1 bevilling(er)
+    [current]
+      kilde: Klubben Holme Søndergård: Nygårdsvej 5, 8270 Højbjerg
+      match: — INTET MATCH —
+      kilde: Drosbjerg 16,1 th, 8260 Viby J
+      match: Drosbjerg 16, 1. th, 8260 Viby J
+```
+
+Both sides are printed because the two systems punctuate the same address differently: a match that looks wrong at a glance usually is not, and one that genuinely is wrong is only visible with the source beside it. Per item rather than as one table at the end, so it reads in the order the queue was built.
+
+The floor variants exist purely for the 15-row cap. The street-only fallback would find these buildings anyway, but a block with more than 15 flats pushes the wanted row out of the results, where it looks absent rather than ambiguous.
+
 Including the floor matters because `/adresse/search` caps at **15 rows**. A block of flats exceeds that on the street prefix alone, and the wanted address would be pushed out of the results and look absent. The street-only prefix is kept as a fallback for the case where the register puts a place name where this assumes the floor is.
 
 Matching relies on the database collation being case-insensitive for the `LIKE` — standard for this instance, but it is a dependency.
