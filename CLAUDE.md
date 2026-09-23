@@ -370,6 +370,16 @@ So every search sends `postnummer` (from the source address itself) and `limit=2
 
 A human in the combobox notices a missing address and types more. A robot records "no match" and moves on, which is why this was invisible until the addresses were listed side by side.
 
+### Initials in street names
+
+| source | register |
+|---|---|
+| `M. P. Hansens vej 14` | `M.P. Hansens Vej 14` |
+
+`_canon` already makes these compare equal — it removes spaces and periods, so both become `mphansensvej14`. The search is what fails: `'m. p. hansens vej 14,'` is not a prefix of `M.P. Hansens Vej 14,`, so nothing comes back for the comparison to work on. Both spellings are therefore generated as search variants.
+
+The rewrite fires only where a single letter and a period are followed by **another** single letter and period. That lookahead is what keeps it off ordinary words: `M. P. Hansens` is rewritten, `P. Hansens` and `Skt. Clemens` are left exactly as they are. Without it, `m. p. hansens vej` would collapse to `m.p.hansens vej`, which matches nothing — and `Skt. Clemens Torv` would break an address that currently works.
+
 ### Zero-padded numbers
 
 The source pads both house numbers and floors, and the register pads neither:

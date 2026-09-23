@@ -251,6 +251,36 @@ def _address_key(row: dict) -> tuple[str, ...] | None:
 _HOUSE_LETTER_SPACED = re.compile(r"(\d)\s+([a-zæøå])$")
 _HOUSE_LETTER_JOINED = re.compile(r"(\d)([a-zæøå])$")
 
+# Initials in a street name, written apart or together: "M. P. Hansens Vej"
+# and "M.P. Hansens Vej" are the same road. Both directions are needed, since
+# either side may be the one with the space.
+#
+# The lookahead is what keeps this off ordinary words: it fires only where a
+# single letter and a period are followed by ANOTHER single letter and period,
+# so "M. P. Hansens" is rewritten and "P. Hansens" alone is left exactly as it
+# is. Without it, "m. p. hansens vej" would collapse to "m.p.hansens vej",
+# which matches nothing.
+_INITIAL_SPACED = re.compile(r"\b([a-zæøå])\.\s+(?=[a-zæøå]\.)")
+_INITIAL_JOINED = re.compile(r"\b([a-zæøå])\.(?=[a-zæøå]\.)")
+
+
+def _rewrite_until_stable(pattern: re.Pattern, replacement: str, tekst: str) -> str:
+    """Apply a rewrite repeatedly until it stops changing anything.
+
+    Each pass rewrites one initial, because the lookahead that makes the rule
+    safe also consumes the context the next one needs. Three initials take
+    three passes.
+    """
+
+    forrige = None
+
+    while forrige != tekst:
+        forrige = tekst
+        tekst = pattern.sub(replacement, tekst)
+
+    return tekst
+
+
 # "1 th" / "1. th" / "st tv" / "st. tv" — a floor token, with or without its
 # period. kl and kld are kælder (basement).
 _FLOOR_PREFIX = re.compile(r"^(\d+|st|kl|kld)\.?\s+(.*)$")
@@ -291,6 +321,13 @@ def _street_variants(street: str) -> list[str]:
     # street-only one. Unlike a padded floor, which the street-only prefix
     # still finds, this has to be spelled correctly or the address is lost.
     varianter += [_PADDED_NUMBER.sub(r"\1", v) for v in list(varianter)]
+
+    # Same story for initials: "M. P. Hansens Vej 14" against the register's
+    # "M.P. Hansens Vej 14" compares equal once _canon has removed the spaces
+    # and periods, but the search never returns the row for it to compare.
+    for variant in list(varianter):
+        varianter.append(_rewrite_until_stable(_INITIAL_SPACED, r"\1.", variant))
+        varianter.append(_rewrite_until_stable(_INITIAL_JOINED, r"\1. ", variant))
 
     return _dedupe(varianter)
 
