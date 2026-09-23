@@ -94,6 +94,12 @@ Registret har tit både adgangsadressen og enhedsadressen — `Øster Kringelvej
 
 Det sker kun ved flertydighed, aldrig når intet passede: ville man tage CPR-adressen dér, opfandt man en adresse, kilden ikke bakker op om. Og kun når de elever, der deler adressen, peger på den samme kandidat.
 
+## Manglende etage, løst på koordinater
+
+En kildeadresse uden etage og dør passer på alle lejligheder i opgangen — og registret giver dem alle **samme koordinat**, ét punkt for bygningen. Koordinaten er det, systemet faktisk bruger: gåafstand til skole og ruteplanlægning. Derfor vælges den første af dem, og kørselsrækken får en kommentar om, at etagen manglede, hvilken bolig der blev antaget, og at den skal rettes manuelt.
+
+Det er en antagelse, ikke et svar, så det prøves først efter CPR-opslaget. Er koordinaterne forskellige, afvises adressen som før — forskellige punkter er forskellige steder.
+
 ## Cache af opslåede adresser
 
 Adresseopslaget er den langsomme del af kø-fasen, og langt de fleste af de ~3700 rækker rammer plet første gang. Derfor gemmes hvert vellykket opslag i `resolved_addresses.csv`, som næste kørsel læser først — så en gentagen kørsel, der kun skal se på de få fejlende adresser, ikke betaler for alle de andre igen.

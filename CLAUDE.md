@@ -361,6 +361,33 @@ Deliberately narrow, in two ways:
 - **Only an ambiguity, never a miss.** Choosing among candidates that already matched keeps the answer consistent with the source. Where *nothing* matched, CPR's address is not among the candidates, and taking it would invent an address the source never supported — `Hørret Byvej 15` with CPR saying `15A` stays unresolved, because that is precisely the case a caseworker must look at.
 - **Only on agreement.** Several students can share one legacy address. If their CPR addresses point at different candidates, that is a new disagreement rather than an answer, and it stays unresolved with both shown.
 
+### A missing floor, resolved by coordinates
+
+Where CPR cannot settle an ambiguity, one case remains that is worth converting anyway. A source address with no floor or door matches every flat in the block — and the register gives all of them **the same latitude and longitude**, one point for the building:
+
+```
+Trige Parkvej 15, 1. mf, 8380 Trige    56.2511085  10.1529227
+Trige Parkvej 15, 1. th, 8380 Trige    56.2511085  10.1529227
+Trige Parkvej 15, st. tv, 8380 Trige   56.2511085  10.1529227
+```
+
+The coordinate is what the application actually uses — walking distance to school, and routing — so any of them carries the same consequences. The first by address text is taken (the search returns them ordered, so the choice is stable across re-runs) and the kørselsrække gets a comment:
+
+```
+Adresse fra foranstaltningsdata konvertering:
+Kilde: Trige Parkvej 15, 8380 Trige
+Adressen mangler etage/dør og passede på 9 boliger i adresseregistret,
+som alle har samme placering.
+Valgt: Trige Parkvej 15, 1. mf, 8380 Trige
+Placeringen er dermed korrekt, men boligen skal rettes manuelt.
+```
+
+This is an **assumption, not an answer** — the dwelling is probably wrong and a caseworker must correct it, which is exactly what the comment says. It is therefore tried only after CPR, which names the actual dwelling and needs no warning.
+
+It refuses whenever the coordinates differ or any is missing. Different points mean genuinely different places, and guessing between those would put a bevilling somewhere the source never pointed.
+
+The `note` column in `resolved_addresses.csv` carries the comment, so a cached hit does not silently drop the warning.
+
 ### Reading an unresolved address
 
 Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe runs **only when nothing matched**, and it tries every street spelling the matcher itself tried — not just the source's raw wording. Probing the raw wording alone is how `Borresøvej 041` once reported the neighbours of `Borresøvej 10`: the padded street found nothing, so it fell straight through to the bare street name, where alphabetical order starts at 10, while `borresøvej 41` would have found the building. The bare street name is kept as a last resort, to answer "does this street exist at all".

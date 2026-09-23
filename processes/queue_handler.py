@@ -634,7 +634,10 @@ def _vaelg_via_cpr(
                                         disagreement, not an answer.
     """
 
-    kandidater = dict(entry.get("kandidater") or [])
+    kandidater = {
+        c["adresse_id"]: c.get("adresse_tekst") or ""
+        for c in entry.get("kandidater") or []
+    }
 
     if len(kandidater) < 2:
         return None
@@ -653,6 +656,65 @@ def _vaelg_via_cpr(
     return adresse_id, kandidater[adresse_id]
 
 
+def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
+    """Settle an ambiguity where every candidate sits at the same point.
+
+    A source address missing its floor and door matches every flat in the
+    block. Those flats are different dwellings, but the register gives them
+    ALL THE SAME latitude and longitude — one point for the building — and the
+    coordinate is what the application actually uses: walking distance to
+    school, and routing.
+
+    So where the candidates differ only in a floor and door the source never
+    recorded, and agree on where they are, any of them carries the same
+    consequences and refusing the lot converts nothing. The first by address
+    text is taken — the search returns them ordered, so the choice is stable
+    across re-runs — and the kørselsrække is given a comment saying the floor
+    was missing and which flat was assumed, because the dwelling is still
+    wrong and a caseworker has to correct it.
+
+    Returns None when the coordinates differ, when any is missing, or when the
+    candidates are not several: different points mean genuinely different
+    places, and guessing between those would put a bevilling somewhere the
+    source never pointed.
+    """
+
+    kandidater = entry.get("kandidater") or []
+
+    if len(kandidater) < 2:
+        return None
+
+    punkter = {
+        (c.get("latitude"), c.get("longitude"))
+        for c in kandidater
+    }
+
+    if len(punkter) != 1:
+        return None
+
+    lat, lon = punkter.pop()
+
+    if lat is None or lon is None:
+        return None
+
+    valgt = min(kandidater, key=lambda c: c.get("adresse_tekst") or "")
+
+    return valgt["adresse_id"], valgt.get("adresse_tekst") or ""
+
+
+def _upraecis_note(kilde: str, antal: int, valgt: str) -> str:
+    """The comment left on a kørselsrække whose address was assumed."""
+
+    return (
+        "Adresse fra foranstaltningsdata konvertering:\n"
+        f"Kilde: {kilde}\n"
+        f"Adressen mangler etage/dør og passede på {antal} boliger i "
+        "adresseregistret, som alle har samme placering.\n"
+        f"Valgt: {valgt}\n"
+        "Placeringen er dermed korrekt, men boligen skal rettes manuelt."
+    )
+
+
 def _unresolved_line(
     key: tuple[str, ...],
     kilde: str,
@@ -661,7 +723,7 @@ def _unresolved_line(
     naboer: list[str],
     cprs: list[str] | None = None,
     lois: list[tuple[str, str]] | None = None,
-    kandidater: list[tuple[str, str]] | None = None,
+    kandidater: list[dict] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -736,7 +798,11 @@ def _unresolved_line(
     return "\n".join(linjer)
 
 
-_CACHE_FELTER = ("noegle", "adresse_id", "adresse_tekst", "kilde")
+# "note" carries the comment left on an address that was only resolved by
+# assuming a floor — without it, a cached hit would silently drop the very
+# warning that says the dwelling still needs correcting. A file written before
+# the column existed simply has no note, which reads as "nothing to warn about".
+_CACHE_FELTER = ("noegle", "adresse_id", "adresse_tekst", "kilde", "note")
 
 
 def _cache_path() -> Path | None:
@@ -747,8 +813,8 @@ def _cache_path() -> Path | None:
     return Path(navn) if navn else None
 
 
-def _load_address_cache() -> dict[tuple[str, ...], tuple[str, str]]:
-    """Addresses resolved by an earlier run: key -> (adresse_id, adresse_tekst).
+def _load_address_cache() -> dict[tuple[str, ...], tuple[str, str, str]]:
+    """Resolved by an earlier run: key -> (adresse_id, adresse_tekst, note).
 
     The queue phase resolves one address at a time against the API, and on a
     full run almost all of them succeed and keep succeeding. Re-running to
@@ -767,7 +833,7 @@ def _load_address_cache() -> dict[tuple[str, ...], tuple[str, str]]:
     if not path or not path.exists():
         return {}
 
-    cache: dict[tuple[str, ...], tuple[str, str]] = {}
+    cache: dict[tuple[str, ...], tuple[str, str, str]] = {}
 
     try:
         with path.open(newline="", encoding="utf-8") as fil:
@@ -780,7 +846,11 @@ def _load_address_cache() -> dict[tuple[str, ...], tuple[str, str]]:
                 adresse_id = (row.get("adresse_id") or "").strip()
 
                 if noegle and adresse_id:
-                    cache[noegle] = (adresse_id, row.get("adresse_tekst") or "")
+                    cache[noegle] = (
+                        adresse_id,
+                        row.get("adresse_tekst") or "",
+                        row.get("note") or "",
+                    )
     except OSError as exc:
         logger.warning("Could not read %s: %s\n", path, exc)
 
@@ -824,7 +894,7 @@ def _open_address_cache():
 
 def _resolve_adresse_ids(
     rows: list[dict],
-) -> tuple[dict[tuple[str, ...], str], dict[str, str]]:
+) -> tuple[dict[tuple[str, ...], str], dict[str, str], dict[tuple[str, ...], str]]:
     """Resolve each distinct bevilling address to an adresse_id.
 
     Resolved against the befordring application's own Adresse table, through
@@ -900,6 +970,9 @@ def _resolve_adresse_ids(
     # adresse_id -> the register's own spelling, so the queue log can show what
     # each source address actually matched rather than a bare GUID.
     tekster: dict[str, str] = {}
+    # key -> the comment its kørselsrækker must carry, for an address resolved
+    # only by assuming a floor the source never recorded.
+    upraecise: dict[tuple[str, ...], str] = {}
     unresolved: list[tuple] = []
 
     for key in sorted(keys):
@@ -907,9 +980,13 @@ def _resolve_adresse_ids(
         # the whole point — on a re-run to inspect a handful of failures,
         # nearly every address takes this branch.
         if key in cache:
-            adresse_id, adresse_tekst = cache[key]
+            adresse_id, adresse_tekst, note = cache[key]
             resolved[key] = adresse_id
             tekster[adresse_id] = adresse_tekst
+
+            if note:
+                upraecise[key] = note
+
             fra_cache += 1
             continue
 
@@ -978,6 +1055,7 @@ def _resolve_adresse_ids(
                     adresse_id,
                     adresse_tekst,
                     kilder[key],
+                    "",
                 ])
                 cache_fil.flush()
 
@@ -1007,13 +1085,10 @@ def _resolve_adresse_ids(
             "forsoeg": forsoeg,
             "naboer": naboer,
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
-            # Kept so an ambiguity can still be settled by CPR below. Ids, not
-            # just the texts _unresolved_line prints.
-            "kandidater": [
-                (c["adresse_id"], c.get("adresse_tekst") or "")
-                for c in candidates
-                if c.get("adresse_id")
-            ],
+            # The raw rows, kept so an ambiguity can still be settled below —
+            # by CPR, or failing that by their coordinates, which the search
+            # returns alongside the text.
+            "kandidater": [c for c in candidates if c.get("adresse_id")],
         })
 
     if unresolved:
@@ -1058,7 +1133,19 @@ def _resolve_adresse_ids(
         stadig_uloeste = []
 
         for entry in unresolved:
+            # CPR first: it names the student's actual dwelling, so where it
+            # can answer, the answer is exact and needs no warning.
             valgt = _vaelg_via_cpr(entry, lois_adresse_id)
+            note = ""
+
+            if valgt is None:
+                # Then coordinates. This one is an ASSUMPTION, not an answer:
+                # the flat is probably wrong, the position is right, and the
+                # kørselsrække says so.
+                valgt = _vaelg_via_koordinater(entry)
+
+                if valgt is not None:
+                    note = _upraecis_note(entry["kilde"], entry["count"], valgt[1])
 
             if valgt is None:
                 stadig_uloeste.append(entry)
@@ -1069,22 +1156,36 @@ def _resolve_adresse_ids(
             resolved[entry["key"]] = adresse_id
             tekster[adresse_id] = adresse_tekst
 
+            if note:
+                upraecise[entry["key"]] = note
+
             if cache_writer is not None:
                 cache_writer.writerow([
                     json.dumps(list(entry["key"]), ensure_ascii=False),
                     adresse_id,
                     adresse_tekst,
                     entry["kilde"],
+                    note,
                 ])
                 cache_fil.flush()
 
-            logger.info(
-                "  %s: %d adresser passede lige godt — valgt %r, fordi CPR "
-                "har eleven boende der.\n",
-                entry["kilde"],
-                entry["count"],
-                adresse_tekst,
-            )
+            if note:
+                logger.warning(
+                    "  %s: %d boliger passede lige godt og ligger samme sted "
+                    "— valgt %r. Placeringen er rigtig, boligen skal rettes "
+                    "manuelt; kørselsrækken får en kommentar om det.\n",
+                    entry["kilde"],
+                    entry["count"],
+                    adresse_tekst,
+                )
+            else:
+                logger.info(
+                    "  %s: %d adresser passede lige godt — valgt %r, fordi CPR "
+                    "har eleven boende der.\n",
+                    entry["kilde"],
+                    entry["count"],
+                    adresse_tekst,
+                )
 
         unresolved = stadig_uloeste
 
@@ -1111,7 +1212,7 @@ def _resolve_adresse_ids(
 
     raise SystemExit("Manual stop")
 
-    return resolved, tekster
+    return resolved, tekster, upraecise
 
 
 # Places whose appearance in ElevensAdresse or SkoleNavnBefordring means the
@@ -1297,7 +1398,7 @@ def retrieve_items_for_queue() -> list[dict]:
     logger.info("Fetched %d row(s) from BefordringsData.\n", len(rows))
 
     # --- Resolve every distinct address up front ---
-    adresse_ids, adresse_tekster = _resolve_adresse_ids(rows)
+    adresse_ids, adresse_tekster, upraecise_adresser = _resolve_adresse_ids(rows)
 
     today = date.today()
     window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
@@ -1323,6 +1424,7 @@ def retrieve_items_for_queue() -> list[dict]:
     items = []
     ambiguous_cases: list[str] = []
     klub_rows = 0
+    upraecise_rows = 0
 
     # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
     # The query orders by CaseID alone, which left the inner grouping at the
@@ -1381,6 +1483,19 @@ def retrieve_items_for_queue() -> list[dict]:
                     klub_rows += 1
 
                 koersel["Kommentar"] = _extend_kommentar(koersel.get("Kommentar"), note)
+
+                # Where this row's address was only resolved by assuming a
+                # floor the source never recorded, the kørselsrække says so.
+                # Per row, like the klub note: it is this journey's address
+                # that was guessed at.
+                adresse_note = upraecise_adresser.get(_address_key(row) or ())
+
+                if adresse_note:
+                    upraecise_rows += 1
+
+                koersel["Kommentar"] = _extend_kommentar(
+                    koersel.get("Kommentar"), adresse_note
+                )
 
                 koerselsraekker.append(koersel)
 
@@ -1524,6 +1639,16 @@ def retrieve_items_for_queue() -> list[dict]:
             "carried across in the comment for a caseworker to rebuild "
             "from.\n",
             klub_rows,
+        )
+
+    if upraecise_rows:
+        logger.warning(
+            "%d kørselsrække(r) have an address that was missing its floor "
+            "and door. Every candidate in the register sat at the same point, "
+            "so the position on the bevilling is right and the walking "
+            "distance will be too — but the dwelling is a guess, and each of "
+            "these carries a comment asking a caseworker to correct it.\n",
+            upraecise_rows,
         )
 
     if ambiguous_cases:
