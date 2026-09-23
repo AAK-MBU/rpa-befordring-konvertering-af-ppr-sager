@@ -2,12 +2,14 @@
 
 import asyncio
 import calendar
+import csv
 import json
 import logging
 import os
 import re
 from datetime import date
 from itertools import groupby
+from pathlib import Path
 
 import pyodbc
 import requests
@@ -636,6 +638,92 @@ def _unresolved_line(
     return "\n".join(linjer)
 
 
+_CACHE_FELTER = ("noegle", "adresse_id", "adresse_tekst", "kilde")
+
+
+def _cache_path() -> Path | None:
+    """Where the resolved-address cache lives, or None when switched off."""
+
+    navn = getattr(config, "RESOLVED_ADDRESS_CACHE", None)
+
+    return Path(navn) if navn else None
+
+
+def _load_address_cache() -> dict[tuple[str, ...], tuple[str, str]]:
+    """Addresses resolved by an earlier run: key -> (adresse_id, adresse_tekst).
+
+    The queue phase resolves one address at a time against the API, and on a
+    full run almost all of them succeed and keep succeeding. Re-running to
+    look at the few that failed should not mean paying for the rest again.
+
+    The key is stored as JSON rather than joined with a separator, because an
+    address component can contain very nearly any punctuation and a separator
+    that turns up inside a component would split it in the wrong place.
+
+    Anything unreadable is skipped rather than fatal: this is a cache, and the
+    worst a bad line can cost is one address resolved again.
+    """
+
+    path = _cache_path()
+
+    if not path or not path.exists():
+        return {}
+
+    cache: dict[tuple[str, ...], tuple[str, str]] = {}
+
+    try:
+        with path.open(newline="", encoding="utf-8") as fil:
+            for row in csv.DictReader(fil):
+                try:
+                    noegle = tuple(json.loads(row["noegle"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+                adresse_id = (row.get("adresse_id") or "").strip()
+
+                if noegle and adresse_id:
+                    cache[noegle] = (adresse_id, row.get("adresse_tekst") or "")
+    except OSError as exc:
+        logger.warning("Could not read %s: %s\n", path, exc)
+
+        return {}
+
+    return cache
+
+
+def _open_address_cache():
+    """Append handle for the cache, with its header written if the file is new.
+
+    Returned open, and written to as each address resolves rather than once at
+    the end: a run over thousands of addresses that dies half way should keep
+    what it had.
+    """
+
+    path = _cache_path()
+
+    if not path:
+        return None, None
+
+    try:
+        nyt = not path.exists() or path.stat().st_size == 0
+        fil = path.open("a", newline="", encoding="utf-8")
+        writer = csv.writer(fil)
+
+        if nyt:
+            writer.writerow(_CACHE_FELTER)
+
+        return fil, writer
+    except OSError as exc:
+        logger.warning(
+            "Could not open %s for writing, so this run will not be cached: "
+            "%s\n",
+            path,
+            exc,
+        )
+
+        return None, None
+
+
 def _resolve_adresse_ids(
     rows: list[dict],
 ) -> tuple[dict[tuple[str, ...], str], dict[str, str]]:
@@ -694,6 +782,10 @@ def _resolve_adresse_ids(
 
     keys = set(kilder)
 
+    cache = _load_address_cache()
+    cache_fil, cache_writer = _open_address_cache()
+    fra_cache = 0
+
     resolved: dict[tuple[str, ...], str] = {}
     # adresse_id -> the register's own spelling, so the queue log can show what
     # each source address actually matched rather than a bare GUID.
@@ -701,6 +793,16 @@ def _resolve_adresse_ids(
     unresolved: list[tuple] = []
 
     for key in sorted(keys):
+        # Straight from an earlier run. Skips the searches entirely, which is
+        # the whole point — on a re-run to inspect a handful of failures,
+        # nearly every address takes this branch.
+        if key in cache:
+            adresse_id, adresse_tekst = cache[key]
+            resolved[key] = adresse_id
+            tekster[adresse_id] = adresse_tekst
+            fra_cache += 1
+            continue
+
         source = list(key)
         candidates: list[dict] = []
         # (prefix, rows the register returned, rows that then matched) — the
@@ -750,8 +852,25 @@ def _resolve_adresse_ids(
                 break
 
         if len(candidates) == 1:
-            resolved[key] = candidates[0]["adresse_id"]
-            tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
+            adresse_id = candidates[0]["adresse_id"]
+            adresse_tekst = candidates[0].get("adresse_tekst") or ""
+
+            resolved[key] = adresse_id
+            tekster[adresse_id] = adresse_tekst
+
+            # Written now, not at the end: a run over thousands of addresses
+            # that dies half way should keep what it had. Successes only —
+            # a failure must be retried on the next run, which is exactly what
+            # a re-run is usually for.
+            if cache_writer is not None:
+                cache_writer.writerow([
+                    json.dumps(list(key), ensure_ascii=False),
+                    adresse_id,
+                    adresse_tekst,
+                    kilder[key],
+                ])
+                cache_fil.flush()
+
             continue
 
         # Two different failures, two different things worth printing.
@@ -780,10 +899,17 @@ def _resolve_adresse_ids(
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
         })
 
+    if cache_fil is not None:
+        cache_fil.close()
+
     logger.info(
-        "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
+        "Resolved %d/%d distinct bevilling address(es) against the Adresse "
+        "table (%d from %s, %d looked up).\n",
         len(resolved),
         len(keys),
+        fra_cache,
+        _cache_path() or "cache",
+        len(resolved) - fra_cache,
     )
 
     if unresolved:

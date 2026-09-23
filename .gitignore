@@ -160,3 +160,6 @@ cython_debug/
 #.idea/
 
 .vscode/*
+
+# Local cache of resolved addresses — a run artefact, not source
+resolved_addresses.csv

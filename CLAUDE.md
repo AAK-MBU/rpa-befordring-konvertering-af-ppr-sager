@@ -329,6 +329,19 @@ A source with no floor/door still matches every flat at that number, which is co
 
 The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
 
+### The resolved-address cache
+
+Address resolution is the slow part of the queue phase — one or more API calls per distinct address, over ~3700 rows of which nearly all resolve first time and never change. Re-running to inspect a handful of failures should not mean paying for the rest again.
+
+`resolved_addresses.csv` (path in `config.RESOLVED_ADDRESS_CACHE`, `None` switches it off) holds one row per resolved address: the normalised key as JSON, the `adresse_id`, the register's spelling, and the source address for eyeballing. It is gitignored — a run artefact, not source.
+
+- **Successes only.** A failure is never cached, so every re-run retries exactly the addresses still being worked on.
+- **Written as it goes**, not at the end, so a run that dies half way keeps what it had.
+- **The key is JSON**, not a joined string: an address component can contain almost any punctuation, and a separator appearing inside one would split it in the wrong place.
+- Anything unreadable in the file is skipped rather than fatal. The worst a bad line costs is one address resolved again.
+
+**Delete the file after changing the matching rules.** A cached hit skips the matcher completely, so an entry written under the old rules would survive the change meant to correct it.
+
 ### Reading an unresolved address
 
 Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe runs **only when nothing matched**, and it tries every street spelling the matcher itself tried — not just the source's raw wording. Probing the raw wording alone is how `Borresøvej 041` once reported the neighbours of `Borresøvej 10`: the padded street found nothing, so it fell straight through to the bare street name, where alphabetical order starts at 10, while `borresøvej 41` would have found the building. The bare street name is kept as a last resort, to answer "does this street exist at all".

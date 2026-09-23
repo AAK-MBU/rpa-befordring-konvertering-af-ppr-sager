@@ -21,3 +21,21 @@ RETRY_BASE_DELAY = 0.5  # seconds (exponential backoff)
 # across runs — worth doing once a conversion date is agreed, so a re-queue
 # after a failure buckets the rows exactly as the first attempt did.
 CONVERSION_WINDOW_END = None
+
+
+# --- Resolved-address cache ---------------------------------------------
+#
+# Address resolution is the slow part of the queue phase: one or more API
+# calls per distinct address, against ~3700 rows of which the overwhelming
+# majority resolve first time and never change. Re-running to look at a
+# handful of failures should not mean paying for all of them again.
+#
+# Successes only. A failure is never cached, so every re-run retries exactly
+# the addresses still being worked on — which is the point.
+#
+# Written as it goes, so a run that dies half way keeps what it had.
+#
+# DELETE THE FILE after changing the matching rules. A cached hit skips the
+# matcher entirely, so an entry written under the old rules would survive a
+# change meant to correct it. Set to None to switch the cache off.
+RESOLVED_ADDRESS_CACHE = "resolved_addresses.csv"

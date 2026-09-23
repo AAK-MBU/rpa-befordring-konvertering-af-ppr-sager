@@ -82,6 +82,14 @@ Alle kald autentificeres med `X-API-Key`.
 | nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
+## Cache af opslåede adresser
+
+Adresseopslaget er den langsomme del af kø-fasen, og langt de fleste af de ~3700 rækker rammer plet første gang. Derfor gemmes hvert vellykket opslag i `resolved_addresses.csv`, som næste kørsel læser først — så en gentagen kørsel, der kun skal se på de få fejlende adresser, ikke betaler for alle de andre igen.
+
+Kun vellykkede opslag gemmes; fejl prøves igen hver gang. Filen skrives løbende, så en kørsel, der dør undervejs, beholder det, den nåede. Den er gitignored.
+
+**Slet filen, når matchreglerne ændres** — et cache-hit springer matcheren helt over, så en linje skrevet under de gamle regler ville overleve den rettelse, der skulle fange den. Sæt `RESOLVED_ADDRESS_CACHE = None` i `helpers/config.py` for at slå cachen fra.
+
 ## Miljøvariabler (`.env`)
 
 | Variabel | Formål |
