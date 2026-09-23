@@ -94,6 +94,14 @@ Registret har tit både adgangsadressen og enhedsadressen — `Øster Kringelvej
 
 Det sker kun ved flertydighed, aldrig når intet passede: ville man tage CPR-adressen dér, opfandt man en adresse, kilden ikke bakker op om. Og kun når de elever, der deler adressen, peger på den samme kandidat.
 
+## Lukkede PPR-sager
+
+`BefordringsData` fortæller ikke, om en sag er lukket, så listen trækkes manuelt fra ESDH til `Lukkede foranstaltningsmapper.csv` med kolonnerne `Sags ID` og `Status` — kun rækker med `Lukket` tæller. Stien står i `helpers/config.py`.
+
+Kan en adresse på en **lukket** sag ikke slås op, oprettes bevillingen på elevens nuværende adresse fra LOIS i stedet for at blive afvist, og hver kørselsrække får en kommentar om det. En lukket sag kan ikke rettes, og dens bevilling er ikke aktiv — så en upræcis adresse koster ingenting, mens en tabt række ikke kan genskabes.
+
+Det sker kun, når ingen af bevillingens rækker kunne slås op, kun for sager i filen, og kun når LOIS kender eleven. Mangler filen, behandles ingen sag som lukket.
+
 ## Manglende etage, løst på koordinater
 
 En kildeadresse uden etage og dør passer på alle lejligheder i opgangen — og registret giver dem alle **samme koordinat**, ét punkt for bygningen. Koordinaten er det, systemet faktisk bruger: gåafstand til skole og ruteplanlægning. Derfor vælges den første af dem, og kørselsrækken får en kommentar om, at etagen manglede, hvilken bolig der blev antaget, og at den skal rettes manuelt.

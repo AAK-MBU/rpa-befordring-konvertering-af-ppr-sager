@@ -447,6 +447,18 @@ def _search_prefixes(source: list[str]) -> list[str]:
 _HOUSE_NUMBER_TAIL = re.compile(r"\s*\d+\s*[a-zæøå]?$")
 
 
+def _cpr_cifre(cpr) -> str:
+    """The ten digits of a CPR, or "" — the form LOIS.CPR.PersonGeoView keys on.
+
+    Used on both sides of that lookup, so a source writing "010101-1234" and a
+    view keyed on "0101011234" still meet.
+    """
+
+    cifre = "".join(c for c in str(cpr or "") if c.isdigit())
+
+    return cifre if len(cifre) == 10 else ""
+
+
 def _lois_adresser(cprs: list[str]) -> dict[str, str]:
     """cpr -> adresse_id from LOIS.CPR.PersonGeoView. Empty dict when unavailable.
 
@@ -474,11 +486,7 @@ def _lois_adresser(cprs: list[str]) -> dict[str, str]:
 
         return {}
 
-    rene = sorted({
-        cifre
-        for cifre in ("".join(c for c in str(cpr or "") if c.isdigit()) for cpr in cprs)
-        if len(cifre) == 10
-    })
+    rene = sorted({cifre for cifre in map(_cpr_cifre, cprs) if cifre})
 
     if not rene:
         return {}
@@ -702,6 +710,19 @@ def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
     return valgt["adresse_id"], valgt.get("adresse_tekst") or ""
 
 
+def _lukket_sag_note(kilde: str, adresse_tekst: str) -> str:
+    """The comment left on a closed case converted onto the student's address."""
+
+    return (
+        "Adresse fra foranstaltningsdata konvertering:\n"
+        f"Kilde: {kilde}\n"
+        "Adressen kunne ikke findes i adresseregistret, og PPR-sagen er "
+        "lukket og kan derfor ikke rettes.\n"
+        "Bevillingen er i stedet oprettet på elevens nuværende adresse: "
+        f"{adresse_tekst}"
+    )
+
+
 def _upraecis_note(kilde: str, antal: int, valgt: str) -> str:
     """The comment left on a kørselsrække whose address was assumed."""
 
@@ -802,6 +823,57 @@ def _unresolved_line(
 # assuming a floor — without it, a cached hit would silently drop the very
 # warning that says the dwelling still needs correcting. A file written before
 # the column existed simply has no note, which reads as "nothing to warn about".
+def _load_lukkede_sager() -> set[str]:
+    """PPR case ids that are closed in ESDH, from the hand-exported CSV.
+
+    BefordringsData carries no case status, so this list is the only way to
+    know. Two columns: "Sags ID" and "Status"; only rows saying "Lukket"
+    count, so an export carrying other statuses can be used unedited.
+
+    A missing file is normal and silent-ish: no case is treated as closed and
+    every address fails exactly as it did before. An unreadable one is
+    reported but never fatal — this only ever ADDS conversions.
+    """
+
+    navn = getattr(config, "CLOSED_CASES_CSV", None)
+
+    if not navn:
+        return set()
+
+    path = Path(navn)
+
+    if not path.exists():
+        logger.info(
+            "%s not found, so no PPR case is treated as closed. Addresses "
+            "that will not resolve are rejected as usual.\n",
+            path,
+        )
+
+        return set()
+
+    lukkede: set[str] = set()
+
+    try:
+        # utf-8-sig: an ESDH export opened and saved in Excel carries a BOM,
+        # which would otherwise become part of the first column's name and
+        # make "Sags ID" unfindable.
+        with path.open(newline="", encoding="utf-8-sig") as fil:
+            for row in csv.DictReader(fil):
+                sags_id = (row.get("Sags ID") or "").strip()
+                status = (row.get("Status") or "").strip().casefold()
+
+                if sags_id and status == "lukket":
+                    lukkede.add(sags_id)
+    except OSError as exc:
+        logger.warning("Could not read %s: %s\n", path, exc)
+
+        return set()
+
+    logger.info("%d PPR case(s) are closed according to %s.\n", len(lukkede), path)
+
+    return lukkede
+
+
 _CACHE_FELTER = ("noegle", "adresse_id", "adresse_tekst", "kilde", "note")
 
 
@@ -1400,6 +1472,47 @@ def retrieve_items_for_queue() -> list[dict]:
     # --- Resolve every distinct address up front ---
     adresse_ids, adresse_tekster, upraecise_adresser = _resolve_adresse_ids(rows)
 
+    # Closed PPR cases whose address will not resolve.
+    #
+    # A closed case cannot be edited, so nobody can ever correct the address,
+    # and its bevilling is not active — an imprecise address costs nothing,
+    # while dropping the row loses data that cannot be recovered. So those are
+    # converted onto the student's current address from LOIS instead, and say
+    # so on every kørselsrække.
+    #
+    # Only for rows that FAILED. A closed case whose address resolves normally
+    # is converted normally.
+    lukkede_sager = _load_lukkede_sager()
+    lukket_adresse: dict[str, tuple[str, str]] = {}
+
+    if lukkede_sager:
+        mangler = {
+            _cpr_cifre(row.get("CPR"))
+            for row in rows
+            if str(row.get("CaseID") or "").strip() in lukkede_sager
+            and (_address_key(row) or ()) not in adresse_ids
+        }
+
+        mangler.discard("")
+
+        if mangler:
+            api_endpoint, api_key = get_api_credentials()
+            headers = {"X-API-Key": api_key}
+
+            for cpr, adresse_id in _lois_adresser(sorted(mangler)).items():
+                tekst = _adresse_tekst(api_endpoint, headers, adresse_id)
+
+                if tekst:
+                    lukket_adresse[cpr] = (adresse_id, tekst)
+
+            logger.info(
+                "%d student(s) on a closed case have an address that will not "
+                "resolve; %d of them could be placed on their current address "
+                "from LOIS.\n",
+                len(mangler),
+                len(lukket_adresse),
+            )
+
     today = date.today()
     window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
 
@@ -1425,6 +1538,7 @@ def retrieve_items_for_queue() -> list[dict]:
     ambiguous_cases: list[str] = []
     klub_rows = 0
     upraecise_rows = 0
+    lukkede_konverteret = 0
 
     # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
     # The query orders by CaseID alone, which left the inner grouping at the
@@ -1450,6 +1564,30 @@ def retrieve_items_for_queue() -> list[dict]:
         for bev_key, bev_iter in groupby(case_rows, key=bucket_of):
             bev_rows = list(bev_iter)
             first = bev_rows[0]
+
+            # A closed case whose address will not resolve is converted onto
+            # the student's current address rather than lost. Decided here,
+            # before the kørselsrækker are built, because every row in the
+            # bevilling then carries the note explaining it.
+            #
+            # Only when NO row in the bevilling resolved: one that did gives a
+            # real address, and that is always better than a substitute.
+            lukket_id = None
+            lukket_note = None
+
+            if (
+                str(ppr_case_id).strip() in lukkede_sager
+                and not any((_address_key(r) or ()) in adresse_ids for r in bev_rows)
+            ):
+                fallback = lukket_adresse.get(_cpr_cifre(person_ssn))
+
+                if fallback:
+                    lukket_id, lukket_tekst = fallback
+                    lukket_note = _lukket_sag_note(
+                        " ".join(str(first.get("ElevensAdresse") or "").split()),
+                        lukket_tekst,
+                    )
+                    lukkede_konverteret += 1
 
             # Bevilling-level fields — shared across rows in this group.
             # Most columns are identical on every row, but nullable fields like
@@ -1497,6 +1635,10 @@ def retrieve_items_for_queue() -> list[dict]:
                     koersel.get("Kommentar"), adresse_note
                 )
 
+                koersel["Kommentar"] = _extend_kommentar(
+                    koersel.get("Kommentar"), lukket_note
+                )
+
                 koerselsraekker.append(koersel)
 
             # The address belongs to the bevilling, not the case: a student
@@ -1535,6 +1677,9 @@ def retrieve_items_for_queue() -> list[dict]:
             # The fallback, and what process_item checks to reject a case whose
             # address could not be matched at all. bevilling_creation overrides
             # it with whichever candidate matches the student's own address.
+            if not bevilling_adresse_kandidater and lukket_id:
+                bevilling_adresse_kandidater = [lukket_id]
+
             bevilling_adresse_id = (
                 bevilling_adresse_kandidater[0]
                 if bevilling_adresse_kandidater
@@ -1639,6 +1784,16 @@ def retrieve_items_for_queue() -> list[dict]:
             "carried across in the comment for a caseworker to rebuild "
             "from.\n",
             klub_rows,
+        )
+
+    if lukkede_konverteret:
+        logger.warning(
+            "%d bevilling(er) on CLOSED PPR cases had an address that could "
+            "not be resolved and were converted onto the student's current "
+            "address from LOIS instead. A closed case cannot be corrected and "
+            "its bevilling is not active, so this preserves the row rather "
+            "than dropping it — each one says so on its kørselsrækker.\n",
+            lukkede_konverteret,
         )
 
     if upraecise_rows:

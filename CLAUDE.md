@@ -361,6 +361,30 @@ Deliberately narrow, in two ways:
 - **Only an ambiguity, never a miss.** Choosing among candidates that already matched keeps the answer consistent with the source. Where *nothing* matched, CPR's address is not among the candidates, and taking it would invent an address the source never supported — `Hørret Byvej 15` with CPR saying `15A` stays unresolved, because that is precisely the case a caseworker must look at.
 - **Only on agreement.** Several students can share one legacy address. If their CPR addresses point at different candidates, that is a new disagreement rather than an answer, and it stays unresolved with both shown.
 
+### Closed PPR cases
+
+`BefordringsData` does not say whether a case is still open, so the list is exported from ESDH by hand into `Lukkede foranstaltningsmapper.csv` — `Sags ID` matching `CaseID`, and `Status`, where only rows saying `Lukket` count. Path in `config.CLOSED_CASES_CSV`. Gitignored; read with `utf-8-sig`, since an export opened in Excel carries a BOM that would otherwise make `Sags ID` unfindable.
+
+Where a **closed** case has an address that will not resolve, the bevilling is created on the student's current address from LOIS instead of being rejected, and every kørselsrække says so:
+
+```
+Adresse fra foranstaltningsdata konvertering:
+Kilde: Findes Ikke Vej 99, 9999 Ingensteds
+Adressen kunne ikke findes i adresseregistret, og PPR-sagen er lukket og kan
+derfor ikke rettes.
+Bevillingen er i stedet oprettet på elevens nuværende adresse: Nyvej 7, 8000 Aarhus C
+```
+
+The reasoning is that a closed case cannot be edited, so nobody can ever correct the address — and its bevilling is not active, so an imprecise address costs nothing, while dropping the row loses data that cannot be recovered.
+
+Narrow on purpose:
+
+- **Only when no row in the bevilling resolved.** One that did gives a real address, which always beats a substitute.
+- **Only for cases in the file.** An open case with the same broken address is still rejected, because there a caseworker can and should fix it.
+- **Only when LOIS knows the student.** No current address means no substitute, and the case is rejected as before.
+
+A missing file is normal: no case is treated as closed and everything fails exactly as it did.
+
 ### A missing floor, resolved by coordinates
 
 Where CPR cannot settle an ambiguity, one case remains that is worth converting anyway. A source address with no floor or door matches every flat in the block — and the register gives all of them **the same latitude and longitude**, one point for the building:

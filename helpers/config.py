@@ -39,3 +39,20 @@ CONVERSION_WINDOW_END = None
 # matcher entirely, so an entry written under the old rules would survive a
 # change meant to correct it. Set to None to switch the cache off.
 RESOLVED_ADDRESS_CACHE = "resolved_addresses.csv"
+
+
+# --- Closed PPR cases ----------------------------------------------------
+#
+# BefordringsData does not say whether a PPR case is still open, so the list
+# is exported from ESDH by hand. Two columns: "Sags ID" (matching CaseID) and
+# "Status", where the rows that count say "Lukket".
+#
+# What it is used for: a closed case cannot be edited, so nobody can ever fix
+# an address it got wrong — and its bevilling is not active, so an imprecise
+# address costs nothing. Rather than lose the row, a closed case whose address
+# will not resolve is converted onto the student's current address from LOIS,
+# and its kørselsrækker say so.
+#
+# Missing file means no case is treated as closed, and those addresses fail as
+# they did before.
+CLOSED_CASES_CSV = "Lukkede foranstaltningsmapper.csv"
