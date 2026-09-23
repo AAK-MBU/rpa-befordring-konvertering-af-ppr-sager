@@ -536,6 +536,28 @@ Two guards on the rule:
 - **Runs of at most three digits.** A four-digit run is postcode-shaped, and Denmark does have postcodes beginning with zero — `0800`, and the `0900`–`0999` København C range. `_canon` is not applied to the postcode component either, so that is two independent guards.
 - **Stripped before the spaces are collapsed.** Once `"vestergade 041"` has become `"vestergade041"` the zero is no longer recognisable as leading, and the rule would either do nothing or hit the wrong digits.
 
+### A floor with no comma before it
+
+```
+Sjællandsgade 95A 1. sal
+```
+
+Splitting on commas leaves the whole string as the first component — the one taken for the street — so every prefix carries the floor and nothing can match. The register holds `Sjællandsgade 95A, 1., 8000 Aarhus C`.
+
+`_components` therefore splits the first part where a house number is followed by something floor-shaped: digits, or `st`/`kl`/`kld`. That last condition is load-bearing. Without it, `Egå Mosevej 31 c` would split into a street and a stray `c`, breaking the house-letter case; with it, only a real floor separates.
+
+### "1. sal" is "1."
+
+The source writes the floor out, the register does not:
+
+| source | register |
+|---|---|
+| `Sjællandsgade 95A, 1. sal` | `Sjællandsgade 95A, 1.` |
+
+`_canon` drops the word, and the search prefixes carry both spellings. Anchored to a leading floor number (`^(\d+)\.?\s*sal\b`), so a street whose name happens to contain "sal" is untouched.
+
+Together these two make `Sjællandsgade 95A 1. sal` resolve **exactly** — one candidate, no assumption, no comment on the kørselsrække. That is worth more than the coordinate fallback would have been: all three flats there share a coordinate, so a guess would have got the position right and the floor wrong, where this gets both right.
+
 ### The source sometimes mis-punctuates the postcode
 
 ```

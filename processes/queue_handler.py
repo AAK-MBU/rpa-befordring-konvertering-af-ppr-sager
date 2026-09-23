@@ -80,6 +80,22 @@ _EMBEDDED_POSTCODE = re.compile(r"^(.*\S)\s*[.,]?\s+(\d{4}\s+\S.*)$")
 # not applied to the postcode component either, so that is two guards.
 _PADDED_NUMBER = re.compile(r"\b0+(\d{1,2})\b")
 
+# A floor glued to the street because the source left out the comma:
+#
+#     Sjællandsgade 95A 1. sal   ->  "Sjællandsgade 95A" + "1. sal"
+#
+# The tail must LOOK like a floor — digits, or st/kl/kld — or this would split
+# "Egå Mosevej 31 c" into a street and a stray "c", breaking the house-letter
+# case. A component with nothing after the house number is left alone.
+_STREET_THEN_FLOOR = re.compile(
+    r"^(.*?\d+\s?[a-zæøå]?)\s+((?:\d+|st|kl|kld)\b.*)$"
+)
+
+# "1. sal" and "1." are the same floor; the source writes it out and the
+# register does not. Anchored to a leading floor number so a street whose name
+# happens to contain "sal" is untouched.
+_FLOOR_SAL = re.compile(r"^(\d+)\.?\s*sal\b")
+
 # Anything outside the characters a Danish address is actually written with.
 # Used only to decide whether an unresolved address should be logged as a
 # repr as well: a zero-width space, a soft hyphen or a decomposed "å" makes a
@@ -124,6 +140,15 @@ def _components(tekst: str | None) -> list[str]:
             head = embedded.group(1).rstrip(".,").strip()
             parts = parts[:-1] + ([head] if head else []) + [embedded.group(2)]
 
+    # A floor stuck to the street for want of a comma. Only the FIRST part,
+    # which is the only one that can be the street, and only when what follows
+    # the house number looks like a floor.
+    if parts:
+        delt = _STREET_THEN_FLOOR.match(parts[0])
+
+        if delt:
+            parts = [delt.group(1).strip(), delt.group(2).strip()] + parts[1:]
+
     return parts
 
 
@@ -154,6 +179,7 @@ def _canon(part: str | None) -> str:
     # as LEADING. Once the spaces are gone, "vestergade 041" is "vestergade041"
     # and the zero is just a digit in the middle of a string.
     samlet = " ".join(str(part or "").split())
+    samlet = _FLOOR_SAL.sub(r"\1.", samlet)
 
     return _PADDED_NUMBER.sub(r"\1", samlet).replace(" ", "").replace(".", "")
 
@@ -400,11 +426,16 @@ def _floor_variants(part: str) -> list[str]:
 
     bar = _PADDED_NUMBER.sub(r"\1", floor)
 
-    return _dedupe([
+    varianter = [
         part,
         f"{floor}. {rest}", f"{floor} {rest}",
         f"{bar}. {rest}", f"{bar} {rest}",
-    ])
+    ]
+
+    # "1. sal" also has to be searched for as the register writes it, "1.".
+    varianter += [_FLOOR_SAL.sub(r"\1.", v).strip() for v in list(varianter)]
+
+    return _dedupe(v for v in varianter if v)
 
 
 def _search_prefixes(source: list[str]) -> list[str]:
