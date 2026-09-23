@@ -54,6 +54,17 @@ _POSTCODE = re.compile(r"^(\d{4})\b")
 # mistaken for a postcode.
 _EMBEDDED_POSTCODE = re.compile(r"^(.*\S)\s*[.,]?\s+(\d{4}\s+\S.*)$")
 
+# A zero-padded house number or floor: "Borresøvej 041" -> 41, "02 tv" -> 2 tv.
+# DAR's canonical husnummer is 1-3 digits with NO leading zeros, so a padded
+# number in the source can only ever mean the unpadded one — there is no
+# distinct address to confuse it with.
+#
+# Limited to runs of at most three digits on purpose. A four-digit run is
+# postcode-shaped, and Denmark does have postcodes beginning with zero (0800,
+# and the 0900-0999 København C range), which this must never touch. _canon is
+# not applied to the postcode component either, so that is two guards.
+_PADDED_NUMBER = re.compile(r"\b0+(\d{1,2})\b")
+
 # Anything outside the characters a Danish address is actually written with.
 # Used only to decide whether an unresolved address should be logged as a
 # repr as well: a zero-width space, a soft hyphen or a decomposed "å" makes a
@@ -124,7 +135,12 @@ def _canon(part: str | None) -> str:
     boundary after the four digits, which stripping spaces would destroy.
     """
 
-    return "".join(str(part or "").split()).replace(".", "")
+    # Order matters: the zero has to be stripped while it is still recognisable
+    # as LEADING. Once the spaces are gone, "vestergade 041" is "vestergade041"
+    # and the zero is just a digit in the middle of a string.
+    samlet = " ".join(str(part or "").split())
+
+    return _PADDED_NUMBER.sub(r"\1", samlet).replace(" ", "").replace(".", "")
 
 
 def _postcode_of(components: list[str]) -> str:
@@ -251,11 +267,19 @@ def _street_variants(street: str) -> list[str]:
         "Egå Mosevej 31C"   ->  also try  "egå mosevej 31 c"
     """
 
-    return _dedupe([
+    varianter = [
         street,
         _HOUSE_LETTER_SPACED.sub(r"\1\2", street),
         _HOUSE_LETTER_JOINED.sub(r"\1 \2", street),
-    ])
+    ]
+
+    # A zero-padded house number has no fallback: the padding sits in the
+    # street component, so EVERY prefix built from it is wrong, including the
+    # street-only one. Unlike a padded floor, which the street-only prefix
+    # still finds, this has to be spelled correctly or the address is lost.
+    varianter += [_PADDED_NUMBER.sub(r"\1", v) for v in list(varianter)]
+
+    return _dedupe(varianter)
 
 
 def _floor_variants(part: str) -> list[str]:
@@ -273,7 +297,13 @@ def _floor_variants(part: str) -> list[str]:
 
     floor, rest = match.group(1), match.group(2)
 
-    return _dedupe([part, f"{floor}. {rest}", f"{floor} {rest}"])
+    bar = _PADDED_NUMBER.sub(r"\1", floor)
+
+    return _dedupe([
+        part,
+        f"{floor}. {rest}", f"{floor} {rest}",
+        f"{bar}. {rest}", f"{bar} {rest}",
+    ])
 
 
 def _search_prefixes(source: list[str]) -> list[str]:
@@ -436,6 +466,9 @@ def _unresolved_line(
     elif naboer:
         linjer.append("      => adressen findes ikke som skrevet; se ovenstående")
 
+    linjer.append("\n")
+    linjer.append("------------------------------------------------------------------------------------------------------------------------------")
+
     return "\n".join(linjer)
 
 
@@ -566,6 +599,8 @@ def _resolve_adresse_ids(
             len(unresolved),
             "\n".join(_unresolved_line(*entry) for entry in unresolved),
         )
+
+    raise SystemExit("Manual stop")
 
     return resolved, tekster
 

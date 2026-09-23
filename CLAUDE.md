@@ -361,6 +361,24 @@ So every search sends `postnummer` (from the source address itself) and `limit=2
 
 A human in the combobox notices a missing address and types more. A robot records "no match" and moves on, which is why this was invisible until the addresses were listed side by side.
 
+### Zero-padded numbers
+
+The source pads both house numbers and floors, and the register pads neither:
+
+| source | register |
+|---|---|
+| `Torstilgårdsvej 34, 02 tv` | `Torstilgårdsvej 34, 2. tv` |
+| `Borresøvej 041` | `Borresøvej 41` |
+
+DAR's canonical husnummer is 1–3 digits with no leading zeros, so a padded number can only ever mean the unpadded one — there is no distinct address to confuse it with, and `70` is untouched because it has no leading zero.
+
+The two halves are not equally dangerous. A padded **floor** is recoverable: the street-only prefix still finds the building and the comparison sorts it out. A padded **house number** is not — the padding sits in the street component, so every prefix built from it is wrong, including the fallback. It has to be spelled correctly or the address is lost outright.
+
+Two guards on the rule:
+
+- **Runs of at most three digits.** A four-digit run is postcode-shaped, and Denmark does have postcodes beginning with zero — `0800`, and the `0900`–`0999` København C range. `_canon` is not applied to the postcode component either, so that is two independent guards.
+- **Stripped before the spaces are collapsed.** Once `"vestergade 041"` has become `"vestergade041"` the zero is no longer recognisable as leading, and the rule would either do nothing or hit the wrong digits.
+
 ### The source sometimes mis-punctuates the postcode
 
 ```
