@@ -4,6 +4,7 @@ import asyncio
 import calendar
 import json
 import logging
+import os
 import re
 from datetime import date
 from itertools import groupby
@@ -18,6 +19,18 @@ from helpers import config
 from processes.bevilling_creation import get_api_credentials
 
 logger = logging.getLogger(__name__)
+
+
+# LOIS, on server 29. Same env var and same view as rpa-befordring-nightly-runs,
+# which reads CPR.PersonGeoView every night to resolve Elev.adresse_id.
+#
+# Used here for diagnostics only: when a legacy address cannot be matched, the
+# warning says where CPR has that student living, which is the correction a
+# caseworker would otherwise look up by hand. Unset simply means that line is
+# missing from the log — it is never required for a conversion, and the
+# BefordringsData connection is a separate thing entirely, fetched from
+# RPAConnection at runtime.
+CONN_STRING_SERVER29 = os.getenv("DBCONNECTIONSTRINGSERVER29")
 
 
 class RequestError(Exception):
@@ -346,6 +359,96 @@ def _search_prefixes(source: list[str]) -> list[str]:
 _HOUSE_NUMBER_TAIL = re.compile(r"\s*\d+\s*[a-zæøå]?$")
 
 
+def _lois_adresser(cprs: list[str]) -> dict[str, str]:
+    """cpr -> adresse_id from LOIS.CPR.PersonGeoView. Empty dict when unavailable.
+
+    The same view and the same key (PNR_0, ten digits, no dash) that
+    rpa-befordring-nightly-runs uses to resolve Elev.adresse_id every night.
+    Where a legacy address cannot be matched, this says where CPR thinks the
+    student actually lives — which is the correction a caseworker would
+    otherwise have to look up by hand, one student at a time.
+
+    Diagnostic only. Every failure is swallowed, including the env var being
+    unset: no LOIS means one missing hint in a warning, never a failed
+    conversion.
+
+    Chunked at 900 for the same reason the nightly run chunks: SQL Server caps
+    a statement at 2100 parameters.
+    """
+
+    if not CONN_STRING_SERVER29:
+        logger.warning(
+            "DBCONNECTIONSTRINGSERVER29 is not set, so the unresolved "
+            "addresses below cannot say where CPR has these students living. "
+            "Set it to the same value rpa-befordring-nightly-runs uses. The "
+            "conversion is unaffected.\n"
+        )
+
+        return {}
+
+    rene = sorted({
+        cifre
+        for cifre in ("".join(c for c in str(cpr or "") if c.isdigit()) for cpr in cprs)
+        if len(cifre) == 10
+    })
+
+    if not rene:
+        return {}
+
+    fundet: dict[str, str] = {}
+
+    try:
+        with pyodbc.connect(CONN_STRING_SERVER29) as conn:
+            cursor = conn.cursor()
+
+            for offset in range(0, len(rene), 900):
+                chunk = rene[offset:offset + 900]
+                placeholders = ",".join("?" for _ in chunk)
+
+                cursor.execute(
+                    f"""
+                    SELECT [PNR_0], CONVERT(NVARCHAR(36), [AdresseId])
+                    FROM   [LOIS].[CPR].[PersonGeoView]
+                    WHERE  [PNR_0] IN ({placeholders})
+                    AND    [AdresseId] IS NOT NULL
+                    """,
+                    chunk,
+                )
+
+                for cpr, adresse_id in cursor.fetchall():
+                    if cpr and adresse_id:
+                        fundet[str(cpr).strip()] = str(adresse_id).strip()
+    except pyodbc.Error as exc:
+        logger.warning(
+            "Could not read LOIS.CPR.PersonGeoView for the unresolved "
+            "addresses, so the log cannot show where CPR has these students "
+            "living. The conversion is unaffected. %s\n",
+            exc,
+        )
+
+        return {}
+
+    return fundet
+
+
+def _adresse_tekst(api_endpoint: str, headers: dict, adresse_id: str) -> str | None:
+    """The register's spelling of one adresse_id. None when it cannot be read."""
+
+    try:
+        response = requests.get(
+            f"{api_endpoint}/adresse/{adresse_id}",
+            headers=headers,
+            timeout=30,
+        )
+
+        if not response.ok:
+            return None
+
+        return (response.json() or {}).get("adresse_tekst")
+    except requests.RequestException:
+        return None
+
+
 def _probe_register(
     api_endpoint: str,
     headers: dict,
@@ -413,6 +516,8 @@ def _unresolved_line(
     count: int,
     forsoeg: list[tuple[str, int, int]],
     naboer: list[str],
+    cprs: list[str] | None = None,
+    lois: list[tuple[str, str]] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -458,6 +563,19 @@ def _unresolved_line(
             linjer.append(f"                     … og {len(naboer) - 8} flere")
     else:
         linjer.append("      registret har: intet på den vej i det postnummer")
+
+    # Where CPR says the student lives now. Not the answer — a bevilling is
+    # granted at the address it was granted at, so a student who has moved
+    # SHOULD differ — but it is the one other fact about this student's
+    # address that exists, and it is usually the correction.
+    if lois:
+        linjer.append("      elev iflg. CPR:")
+        linjer.extend(
+            f"                     {cpr}: {tekst or '(kendes ikke i Adresse-tabellen)'}"
+            for cpr, tekst in lois
+        )
+    elif cprs:
+        linjer.append(f"      elev iflg. CPR: intet opslag for {', '.join(cprs)}")
 
     if count > 1:
         linjer.append(
@@ -510,11 +628,23 @@ def _resolve_adresse_ids(
     # exactly the punctuation a failure usually turns on.
     kilder: dict[tuple[str, ...], str] = {}
 
+    # key -> the CPRs whose rows used this address. Only needed for failures,
+    # where it is what lets the log say where CPR has that student living.
+    cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
+
     for row in rows:
         key = _address_key(row)
 
-        if key and key not in kilder:
+        if not key:
+            continue
+
+        if key not in kilder:
             kilder[key] = " ".join(str(row.get("ElevensAdresse") or "").split())
+
+        cpr = str(row.get("CPR") or "").strip()
+
+        if cpr:
+            cpr_pr_adresse.setdefault(key, set()).add(cpr)
 
     keys = set(kilder)
 
@@ -578,13 +708,14 @@ def _resolve_adresse_ids(
             tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
             continue
 
-        unresolved.append((
-            key,
-            kilder[key],
-            len(candidates),
-            forsoeg,
-            _probe_register(api_endpoint, headers, source, postnummer),
-        ))
+        unresolved.append({
+            "key": key,
+            "kilde": kilder[key],
+            "count": len(candidates),
+            "forsoeg": forsoeg,
+            "naboer": _probe_register(api_endpoint, headers, source, postnummer),
+            "cprs": sorted(cpr_pr_adresse.get(key, set())),
+        })
 
     logger.info(
         "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
@@ -593,11 +724,36 @@ def _resolve_adresse_ids(
     )
 
     if unresolved:
+        # Where CPR has these students living, for the caseworker who has to
+        # correct the legacy address by hand. One query covering every failure
+        # rather than one per address, and only for failures — a clean run
+        # never touches LOIS.
+        lois_adresse_id: dict[str, str] = {}
+        lois_tekst: dict[str, str] = {}
+
+        alle_cprs = [cpr for entry in unresolved for cpr in entry["cprs"]]
+        lois_adresse_id = _lois_adresser(alle_cprs)
+
+        # One call per DISTINCT address: several students behind the same
+        # failing address usually share one.
+        for adresse_id in sorted(set(lois_adresse_id.values())):
+            tekst = _adresse_tekst(api_endpoint, headers, adresse_id)
+
+            if tekst:
+                lois_tekst[adresse_id] = tekst
+
+        for entry in unresolved:
+            entry["lois"] = [
+                (cpr, lois_tekst.get(lois_adresse_id.get(cpr, ""), ""))
+                for cpr in entry["cprs"]
+                if cpr in lois_adresse_id
+            ]
+
         logger.warning(
             "%d address(es) unresolved — the bevillinger using them will be "
             "rejected for manual follow-up:\n%s\n",
             len(unresolved),
-            "\n".join(_unresolved_line(*entry) for entry in unresolved),
+            "\n".join(_unresolved_line(**entry) for entry in unresolved),
         )
 
     raise SystemExit("Manual stop")

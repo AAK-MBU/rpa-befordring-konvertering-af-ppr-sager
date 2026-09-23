@@ -82,8 +82,9 @@ Every call authenticates with `X-API-Key` from `API_KEY`.
 | `ATS_WORKQUEUE_OVERRIDE` | Override the workqueue id (dev/test) |
 | `API_ENDPOINT` | Base URL of the befordring API |
 | `API_KEY` | Sent as `X-API-Key`. Must match a hash in the target environment's `API_KEY_HASHES` — see that repo's `.env.example` |
+| `DBCONNECTIONSTRINGSERVER29` | LOIS, read only. Same variable and same value as `rpa-befordring-nightly-runs`. **Optional** — used only to tell an unresolved address where CPR has that student living; unset, that one line is missing from the warning and nothing else changes |
 
-The RPA database connection string is **not** an env var; it is fetched at runtime from `RPAConnection`.
+The connection to the RPA database (`BefordringsData`) is **not** an env var; it is fetched at runtime from `RPAConnection`. `DBCONNECTIONSTRINGSERVER29` is separate and points at a different server.
 
 ## Known issues
 
@@ -331,6 +332,12 @@ The trailing comma is what makes a prefix safe: every `adresse_tekst` has one st
 ### Reading an unresolved address
 
 Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe drops the trailing comma the matcher's own searches all end in: that comma is what stops `Hørret Byvej 15,` matching `Hørret Byvej 150,`, but it also means that when the register has `15A` and no bare `15`, every search returns nothing and the log can only say `0`.
+
+A failure also reports **where CPR has that student living**, looked up in `LOIS.CPR.PersonGeoView` on `PNR_0` — the same view and the same key `rpa-befordring-nightly-runs` uses to resolve `Elev.adresse_id` every night — and turned into text through `GET /adresse/{adresse_id}`. For `Hørret Byvej 15` that is `15C`, which is the correction a caseworker would otherwise have looked up by hand, one student at a time.
+
+It is a hint, not an answer: a bevilling is granted at the address it was granted at, so a student who has since moved *should* differ. But it is the one other fact about this student's address that exists.
+
+One batched query covering every failure, and only on failure — a clean run never touches LOIS. Every error is swallowed and logged as a note: it is not certain this connection reaches LOIS at all, since `BefordringsData` is in `[RPA]` and the view is in `[LOIS]`. If they are not on the same server the lookup simply says so and the conversion carries on.
 
 Three signatures, and they say different things:
 
