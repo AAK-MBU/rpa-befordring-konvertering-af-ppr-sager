@@ -262,6 +262,7 @@ def _matches(candidate_tekst: str | None, source: list[str]) -> bool:
 # does not swallow "Årslev Møllevej 190".
 _ADRESSE_OVERRIDES: tuple[tuple[str, str], ...] = (
     ("Årslev Møllevej 19", "Årslev Møllevej 19, 8220 Brabrand"),
+    ("Nordre Strandvej 155", "Nordre Strandvej 155, 8240 Risskov"),
 )
 
 
