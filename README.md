@@ -82,6 +82,18 @@ Alle kald autentificeres med `X-API-Key`.
 | nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
+## Manuelle adresserettelser
+
+`adresse_erstatninger.csv` med kolonnerne `Find` og `Erstat` retter formuleringer, ingen regel kan udlede — fx et forkortet vejnavn:
+
+| Find | Erstat |
+|---|---|
+| `I. Christensens Gade` | `Inger Christensens Gade` |
+
+Tilføj en linje og kør igen; der skal ikke ændres kode. Der matches uden hensyn til store/små bogstaver og mellemrum, længste frase først, og rettelsen bruges på alle adresser — ikke kun dem, der fejler. Filen læses én gang pr. kørsel, så en ændring kræver en genstart.
+
+Loggens `kilde` viser stadig den rå kildeadresse, så en rettelse aldrig skjuler, hvad der faktisk stod. Havde adressen allerede slået op på noget forkert, skal dens linje også slettes fra `resolved_addresses.csv`.
+
 ## Kendte særadresser
 
 Nogle adresser er skrevet på en måde, ingen generel normalisering kan nå. Det gælder "Center for Børne- og Ungehjem", hvor kilden skriver hjemmets eget navn foran vejen — `Toppen, Årslev Møllevej 19, 8220 Brabrand`. `Toppen` bliver dermed det første komma-led, altså det matcheren tager for vejnavnet, og så kan intet passe.

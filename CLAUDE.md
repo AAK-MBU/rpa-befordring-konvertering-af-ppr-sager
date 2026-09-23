@@ -492,6 +492,26 @@ So every search sends `postnummer` (from the source address itself) and `limit=2
 
 A human in the combobox notices a missing address and types more. A robot records "no match" and moves on, which is why this was invisible until the addresses were listed side by side.
 
+### Manual phrase corrections (`adresse_erstatninger.csv`)
+
+For wordings no rule can derive. The case it was built for is an abbreviated street name:
+
+| Find | Erstat |
+|---|---|
+| `I. Christensens Gade` | `Inger Christensens Gade` |
+
+Nothing about the text says what `I.` stands for, and no register lookup can find out — so it is simply written down. Two columns, `Find` and `Erstat`; add a row and re-run. No code change, nothing else to touch.
+
+- Matched **case-insensitively** and **across any amount of whitespace**, so `I.  Christensens  Gade` and `i. christensens gade` hit the same row.
+- **Longest phrase first**, so a specific correction is not pre-empted by a shorter one that overlaps it.
+- Applied to **every** address, not only failing ones — a correction is a correction, and an address that resolved to the wrong place is worse than one that did not resolve.
+- Loaded once per run (`lru_cache`), because `_address_key` runs per row over thousands of rows. **Restart to pick up an edit.**
+- The raw source is still what the logs print as `kilde`, so a correction never hides what the caseworker actually wrote. The `normaliseret` line shows the corrected form.
+
+Tracked in git, unlike the other CSVs: it is curated knowledge that should not be lost or re-derived.
+
+**If an address had already resolved to something wrong, delete its row from `resolved_addresses.csv` too** — a cached hit skips this entirely.
+
 ### Known special addresses (`_ADRESSE_OVERRIDES`)
 
 Some addresses are written in a form no general normalisation can reach. The case this exists for is "Center for Børne- og Ungehjem", where the source puts the home's own name in front of the street:

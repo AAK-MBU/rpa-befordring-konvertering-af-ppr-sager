@@ -56,3 +56,23 @@ RESOLVED_ADDRESS_CACHE = "resolved_addresses.csv"
 # Missing file means no case is treated as closed, and those addresses fail as
 # they did before.
 CLOSED_CASES_CSV = "Lukkede foranstaltningsmapper.csv"
+
+
+# --- Manual address corrections ------------------------------------------
+#
+# Phrase-level search and replace on the source address, for wordings no rule
+# can derive. The case it was built for is an abbreviated street name:
+#
+#     Find                    Erstat
+#     I. Christensens Gade    Inger Christensens Gade
+#
+# Two columns, "Find" and "Erstat". Edit the file and re-run — no code change,
+# and nothing else has to be touched. Deleting resolved_addresses.csv first is
+# only necessary if the address had already resolved to something wrong.
+#
+# Matched case-insensitively and across any amount of whitespace, so
+# "I.  Christensens  Gade" hits the same row. Applied to every address, not
+# only failing ones: a correction is a correction.
+#
+# Missing file means no replacements, which is the behaviour without it.
+ADDRESS_REPLACEMENTS_CSV = "adresse_erstatninger.csv"

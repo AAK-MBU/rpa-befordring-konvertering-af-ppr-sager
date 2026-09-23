@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from datetime import date
+from functools import lru_cache
 from itertools import groupby
 from pathlib import Path
 
@@ -264,6 +265,77 @@ _ADRESSE_OVERRIDES: tuple[tuple[str, str], ...] = (
 )
 
 
+@lru_cache(maxsize=1)
+def _adresse_erstatninger() -> tuple[tuple[re.Pattern, str], ...]:
+    """Manual phrase corrections, compiled once.
+
+    Two columns, "Find" and "Erstat". For wordings no rule can derive — the
+    case it exists for is an abbreviated street name:
+
+        I. Christensens Gade   ->   Inger Christensens Gade
+
+    Nothing about the text says what "I." stands for, and no register lookup
+    can find out, so it is simply written down. Add a row and re-run; no code
+    change is needed.
+
+    The phrase is matched case-insensitively and across any amount of
+    whitespace, so "I.  Christensens  Gade" hits the same row. Longest phrase
+    first, so a specific correction is not pre-empted by a shorter one that
+    happens to overlap it.
+
+    lru_cache because _address_key runs per row over thousands of rows, and
+    this must not become a file read each time. Restart to pick up an edit.
+    """
+
+    navn = getattr(config, "ADDRESS_REPLACEMENTS_CSV", None)
+
+    if not navn:
+        return ()
+
+    path = Path(navn)
+
+    if not path.exists():
+        return ()
+
+    par: list[tuple[str, str]] = []
+
+    try:
+        # utf-8-sig: the file is hand-edited, quite possibly in Excel.
+        with path.open(newline="", encoding="utf-8-sig") as fil:
+            for row in csv.DictReader(fil):
+                find = (row.get("Find") or "").strip()
+                erstat = (row.get("Erstat") or "").strip()
+
+                if find and erstat:
+                    par.append((find, erstat))
+    except OSError as exc:
+        logger.warning("Could not read %s: %s\n", path, exc)
+
+        return ()
+
+    if par:
+        logger.info("%d manual address correction(s) loaded from %s.\n", len(par), path)
+
+    return tuple(
+        (
+            re.compile(r"\s+".join(re.escape(ord_) for ord_ in find.split()), re.IGNORECASE),
+            erstat,
+        )
+        for find, erstat in sorted(par, key=lambda p: len(p[0]), reverse=True)
+    )
+
+
+def _ret_adresse(tekst: str | None) -> str:
+    """Apply every manual phrase correction to an address."""
+
+    rettet = str(tekst or "")
+
+    for pattern, erstat in _adresse_erstatninger():
+        rettet = pattern.sub(erstat, rettet)
+
+    return rettet
+
+
 def _override_adresse(tekst: str | None) -> str | None:
     """The canonical address for a known special case, or None."""
 
@@ -300,11 +372,13 @@ def _address_key(row: dict) -> tuple[str, ...] | None:
     is only a fallback for a row whose address string is missing it.
     """
 
-    raa = row.get("ElevensAdresse")
+    # Manual phrase corrections first — they fix the WORDING, and a corrected
+    # wording is what everything downstream should see.
+    raa = _ret_adresse(row.get("ElevensAdresse"))
 
-    # A known special case is replaced wholesale before parsing: what makes
-    # these unmatchable is the SHAPE of the string, so there is nothing for
-    # the component logic to work with.
+    # Then the whole-address overrides: what makes those unmatchable is the
+    # SHAPE of the string, so there is nothing for the component logic to
+    # work with and it is replaced outright.
     components = _components(_override_adresse(raa) or raa)
 
     if not components:
@@ -1104,6 +1178,7 @@ def _resolve_adresse_ids(
     # where it is what lets the log say where CPR has that student living.
     cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
     overskrevne = 0
+    rettede = 0
 
     for row in rows:
         key = _address_key(row)
@@ -1117,12 +1192,23 @@ def _resolve_adresse_ids(
         if _override_adresse(row.get("ElevensAdresse")):
             overskrevne += 1
 
+        if _ret_adresse(row.get("ElevensAdresse")) != str(row.get("ElevensAdresse") or ""):
+            rettede += 1
+
         cpr = str(row.get("CPR") or "").strip()
 
         if cpr:
             cpr_pr_adresse.setdefault(key, set()).add(cpr)
 
     keys = set(kilder)
+
+    if rettede:
+        logger.info(
+            "%d row(s) had a manual phrase correction applied to their "
+            "address — see %s.\n",
+            rettede,
+            getattr(config, "ADDRESS_REPLACEMENTS_CSV", "?"),
+        )
 
     if overskrevne:
         logger.info(
