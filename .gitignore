@@ -163,3 +163,4 @@ cython_debug/
 
 # Local cache of resolved addresses — a run artefact, not source
 resolved_addresses.csv
+Lukkede foranstaltningsmapper.csv
