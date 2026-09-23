@@ -664,6 +664,72 @@ def _vaelg_via_cpr(
     return adresse_id, kandidater[adresse_id]
 
 
+def _vaelg_via_cpr_uden_match(
+    entry: dict,
+    lois_adresse_id: dict[str, str],
+) -> tuple[str, str] | None:
+    """Settle a MISS with CPR, where the source's floor and door match nothing.
+
+    The case this exists for:
+
+        source     Steen Billes Gade 8, 3. tv, 8200 Aarhus N
+        register   Steen Billes Gade 8, 3., 8200 Aarhus N   <- no door at all
+        CPR        Steen Billes Gade 8, 3., 8200 Aarhus N
+
+    The building is found, the floor is found, and the source has invented a
+    door the register does not use. No rule about the text can bridge that —
+    a missing part is exactly what _matches must refuse, or every wrong flat
+    would match every other. But CPR names the row outright.
+
+    The pool is every row the searches RETURNED, matched or not. That is what
+    keeps this apart from inventing an address: every one of those rows begins
+    with the source's own street and house number, because the prefix ends in
+    a comma. So the answer is always the same building the source named, and
+    only the floor and door — the part the source got wrong — come from CPR.
+
+    Which is precisely why "Hørret Byvej 15" with CPR saying "15A" is still
+    refused: 15A does not start with "Hørret Byvej 15," so it was never in the
+    pool. A different house number is a different address, and a caseworker
+    has to make that call.
+
+    Only on a true miss, and only where the CPRs behind the address agree.
+    """
+
+    if entry.get("count"):
+        return None
+
+    raekker = entry.get("raekker") or {}
+
+    if not raekker:
+        return None
+
+    valgte = {
+        lois_adresse_id[cpr]
+        for cpr in entry.get("cprs") or []
+        if lois_adresse_id.get(cpr) in raekker
+    }
+
+    if len(valgte) != 1:
+        return None
+
+    adresse_id = valgte.pop()
+
+    return adresse_id, raekker[adresse_id].get("adresse_tekst") or ""
+
+
+def _cpr_korrektion_note(kilde: str, valgt: str) -> str:
+    """The comment left on a kørselsrække whose door came from CPR."""
+
+    return (
+        "Adresse fra foranstaltningsdata konvertering:\n"
+        f"Kilde: {kilde}\n"
+        "Adressen findes ikke som skrevet i adresseregistret — etage/dør "
+        "passer ikke.\n"
+        f"Eleven er iflg. CPR registreret på: {valgt}\n"
+        "Samme vej og husnummer, så bevillingen er oprettet der."
+    )
+
+
 def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
     """Settle an ambiguity where every candidate sits at the same point.
 
@@ -745,6 +811,7 @@ def _unresolved_line(
     cprs: list[str] | None = None,
     lois: list[tuple[str, str]] | None = None,
     kandidater: list[dict] | None = None,
+    raekker: dict[str, dict] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -772,9 +839,9 @@ def _unresolved_line(
         f"      normaliseret : {normaliseret}",
     ]
 
-    for prefix, raekker, matchede in forsoeg:
+    for prefix, antal, matchede in forsoeg:
         linjer.append(
-            f"      søgte på     : {prefix!r} → {raekker} række(r), {matchede} match"
+            f"      søgte på     : {prefix!r} → {antal} række(r), {matchede} match"
         )
 
     # Only the source. normaliseret is joined with " | ", and the pipe would
@@ -1068,6 +1135,7 @@ def _resolve_adresse_ids(
         # difference between the last two is what says whether the matcher or
         # the source data is at fault.
         forsoeg: list[tuple[str, int, int]] = []
+        alle_raekker: dict[str, dict] = {}
 
         # Always sent with the search. Adresse is the whole of Denmark — the
         # nightly import reads AdresseDkGeoView with no municipality filter —
@@ -1098,6 +1166,14 @@ def _resolve_adresse_ids(
                 )
 
             raekker = response.json() or []
+
+            # Every row the searches returned, matched or not. All of them
+            # start with the source's own street and house number — that is
+            # what the trailing comma in the prefix guarantees — which is what
+            # makes them a safe pool for the CPR fallback below.
+            for raekke in raekker:
+                if raekke.get("adresse_id"):
+                    alle_raekker[raekke["adresse_id"]] = raekke
 
             candidates = [
                 candidate
@@ -1161,6 +1237,10 @@ def _resolve_adresse_ids(
             # by CPR, or failing that by their coordinates, which the search
             # returns alongside the text.
             "kandidater": [c for c in candidates if c.get("adresse_id")],
+            # Everything the searches turned up at this street and house
+            # number, matched or not — the pool CPR may pick from when the
+            # source's floor and door match nothing.
+            "raekker": alle_raekker,
         })
 
     if unresolved:
@@ -1209,6 +1289,18 @@ def _resolve_adresse_ids(
             # can answer, the answer is exact and needs no warning.
             valgt = _vaelg_via_cpr(entry, lois_adresse_id)
             note = ""
+            metode = "cpr"
+
+            if valgt is None:
+                # Then CPR again, for a miss rather than an ambiguity: the
+                # source's floor and door match nothing, but CPR names a row
+                # at the same street and house number. A correction rather
+                # than a guess, though the kørselsrække still records it.
+                valgt = _vaelg_via_cpr_uden_match(entry, lois_adresse_id)
+
+                if valgt is not None:
+                    note = _cpr_korrektion_note(entry["kilde"], valgt[1])
+                    metode = "cpr-korrektion"
 
             if valgt is None:
                 # Then coordinates. This one is an ASSUMPTION, not an answer:
@@ -1218,6 +1310,7 @@ def _resolve_adresse_ids(
 
                 if valgt is not None:
                     note = _upraecis_note(entry["kilde"], entry["count"], valgt[1])
+                    metode = "koordinat"
 
             if valgt is None:
                 stadig_uloeste.append(entry)
@@ -1241,13 +1334,21 @@ def _resolve_adresse_ids(
                 ])
                 cache_fil.flush()
 
-            if note:
+            if metode == "koordinat":
                 logger.warning(
                     "  %s: %d boliger passede lige godt og ligger samme sted "
                     "— valgt %r. Placeringen er rigtig, boligen skal rettes "
                     "manuelt; kørselsrækken får en kommentar om det.\n",
                     entry["kilde"],
                     entry["count"],
+                    adresse_tekst,
+                )
+            elif metode == "cpr-korrektion":
+                logger.warning(
+                    "  %s: etage/dør findes ikke i registret — valgt %r, hvor "
+                    "CPR har eleven registreret, samme vej og husnummer. "
+                    "Kørselsrækken får en kommentar om det.\n",
+                    entry["kilde"],
                     adresse_tekst,
                 )
             else:

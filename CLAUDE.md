@@ -294,6 +294,21 @@ This bot used to `POST /citizen/create_elev` with just `{cpr, adresse_id}`. That
 
 So a miss now raises `BusinessError`, which sends the item to `pending_user` rather than failing it. Nothing the bot can do resolves it; a person has to decide whether that student should be converted at all.
 
+### Resolution order
+
+An address is resolved by the first of these that answers. Each step is weaker than the one above it, and everything below the first is recorded on the kørselsrække:
+
+| # | step | evidence | comment left? |
+|---|---|---|---|
+| 1 | exactly one register row matches | the source itself | no |
+| 2 | several matched, CPR names one of them | CPR | no — it is the student's actual dwelling |
+| 3 | none matched, CPR names a row at the same street and house number | CPR | yes — the source's floor/door was wrong |
+| 4 | several matched and all sit at the same coordinate | position only | yes — the flat is a guess |
+| 5 | the case is closed and LOIS knows the student | the student's current address | yes — the bevilling is inactive and uncorrectable |
+| — | otherwise | — | rejected for manual follow-up |
+
+Steps 3–5 each convert something that would otherwise be lost, and each says in the kørselsrække's comment exactly what was assumed and why. Nothing below step 2 is presented as correct.
+
 ### How addresses are matched
 
 The two systems write the middle of an address differently, and the difference is **not one thing**:
@@ -384,6 +399,30 @@ Narrow on purpose:
 - **Only when LOIS knows the student.** No current address means no substitute, and the case is rejected as before.
 
 A missing file is normal: no case is treated as closed and everything fails exactly as it did.
+
+### A floor and door that match nothing, corrected by CPR
+
+```
+source     Steen Billes Gade 8, 3. tv, 8200 Aarhus N
+register   Steen Billes Gade 8, 3., 8200 Aarhus N     <- no door at all
+CPR        Steen Billes Gade 8, 3., 8200 Aarhus N
+```
+
+The building and the floor both exist; the source has invented a door the register does not use. No rule about the text can bridge that — a missing part is exactly what `_matches` must refuse, or every wrong flat would match every other one. CPR names the row outright.
+
+The pool CPR may pick from is every row the searches **returned**, matched or not. That is what separates this from inventing an address: all of those rows begin with the source's own street and house number, because the search prefix ends in a comma. The answer is therefore always the building the source named, and only the floor and door — the part the source got wrong — come from CPR.
+
+Which is exactly why `Hørret Byvej 15` with CPR saying `15A` is still refused: `15A` does not start with `Hørret Byvej 15,`, so it was never in the pool. A different house number is a different address, and a caseworker has to make that call.
+
+The kørselsrække records it:
+
+```
+Adresse fra foranstaltningsdata konvertering:
+Kilde: Steen Billes Gade 8, 3. tv. 8200 Aarhus N
+Adressen findes ikke som skrevet i adresseregistret — etage/dør passer ikke.
+Eleven er iflg. CPR registreret på: Steen Billes Gade 8, 3., 8200 Aarhus N
+Samme vej og husnummer, så bevillingen er oprettet der.
+```
 
 ### A missing floor, resolved by coordinates
 
