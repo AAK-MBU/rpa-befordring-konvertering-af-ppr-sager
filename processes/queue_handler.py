@@ -217,6 +217,50 @@ def _matches(candidate_tekst: str | None, source: list[str]) -> bool:
     return all(_canon(part) in remaining for part in source[1:-1])
 
 
+# Addresses the source writes in a form no amount of general normalisation can
+# reach, mapped to what they are in the register.
+#
+# The case this exists for is "Center for Børne- og Ungehjem": the source
+# writes the home's own name in front of the street —
+#
+#     Toppen, Årslev Møllevej 19, 8220 Brabrand
+#
+# and the name becomes the first comma-component, i.e. what the matcher takes
+# for the street. Every prefix is then built from "Toppen" and nothing can
+# match. The homes are a known, finite list, so naming them here is both
+# simpler and safer than guessing which leading components are not streets.
+#
+# Matched as a substring through _fold, so case, spacing and æ/ø/å spelling do
+# not matter — but never across a longer house number, so "Årslev Møllevej 19"
+# does not swallow "Årslev Møllevej 190".
+_ADRESSE_OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("Årslev Møllevej 19", "Årslev Møllevej 19, 8220 Brabrand"),
+)
+
+
+def _override_adresse(tekst: str | None) -> str | None:
+    """The canonical address for a known special case, or None."""
+
+    haystack = _fold(tekst)
+
+    for marker, kanonisk in _ADRESSE_OVERRIDES:
+        naal = _fold(marker)
+        start = haystack.find(naal)
+
+        if start == -1:
+            continue
+
+        slut = start + len(naal)
+
+        # "19" must not be the front of "190".
+        if slut < len(haystack) and haystack[slut].isdigit():
+            continue
+
+        return kanonisk
+
+    return None
+
+
 def _address_key(row: dict) -> tuple[str, ...] | None:
     """The normalised components of the address a row's bevilling is for.
 
@@ -230,7 +274,12 @@ def _address_key(row: dict) -> tuple[str, ...] | None:
     is only a fallback for a row whose address string is missing it.
     """
 
-    components = _components(row.get("ElevensAdresse"))
+    raa = row.get("ElevensAdresse")
+
+    # A known special case is replaced wholesale before parsing: what makes
+    # these unmatchable is the SHAPE of the string, so there is nothing for
+    # the component logic to work with.
+    components = _components(_override_adresse(raa) or raa)
 
     if not components:
         return None
@@ -814,6 +863,7 @@ def _resolve_adresse_ids(
     # key -> the CPRs whose rows used this address. Only needed for failures,
     # where it is what lets the log say where CPR has that student living.
     cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
+    overskrevne = 0
 
     for row in rows:
         key = _address_key(row)
@@ -824,12 +874,23 @@ def _resolve_adresse_ids(
         if key not in kilder:
             kilder[key] = " ".join(str(row.get("ElevensAdresse") or "").split())
 
+        if _override_adresse(row.get("ElevensAdresse")):
+            overskrevne += 1
+
         cpr = str(row.get("CPR") or "").strip()
 
         if cpr:
             cpr_pr_adresse.setdefault(key, set()).add(cpr)
 
     keys = set(kilder)
+
+    if overskrevne:
+        logger.info(
+            "%d row(s) use an address written in a known special form and "
+            "were rewritten to the register's wording before matching — see "
+            "_ADRESSE_OVERRIDES.\n",
+            overskrevne,
+        )
 
     cache = _load_address_cache()
     cache_fil, cache_writer = _open_address_cache()

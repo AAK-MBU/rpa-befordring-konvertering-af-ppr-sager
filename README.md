@@ -82,6 +82,12 @@ Alle kald autentificeres med `X-API-Key`.
 | nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
+## Kendte særadresser
+
+Nogle adresser er skrevet på en måde, ingen generel normalisering kan nå. Det gælder "Center for Børne- og Ungehjem", hvor kilden skriver hjemmets eget navn foran vejen — `Toppen, Årslev Møllevej 19, 8220 Brabrand`. `Toppen` bliver dermed det første komma-led, altså det matcheren tager for vejnavnet, og så kan intet passe.
+
+`_ADRESSE_OVERRIDES` i `processes/queue_handler.py` oversætter den slags til registrets egen skrivemåde, før adressen overhovedet bliver delt op. Tilføj en linje pr. nyt hjem. Kørslen logger, hvor mange rækker der blev skrevet om.
+
 ## Når CPR afgør en flertydig adresse
 
 Registret har tit både adgangsadressen og enhedsadressen — `Øster Kringelvej 25` og `Øster Kringelvej 25, st.` er samme bolig skrevet to gange — og kilden siger `25`, hvilket passer på begge. Her slår robotten op i CPR: passer præcis én af kandidaterne med elevens egen adresse, vælges den, og valget skrives i loggen med adressens navn.

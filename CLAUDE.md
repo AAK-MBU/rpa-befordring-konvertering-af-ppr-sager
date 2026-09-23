@@ -402,6 +402,22 @@ So every search sends `postnummer` (from the source address itself) and `limit=2
 
 A human in the combobox notices a missing address and types more. A robot records "no match" and moves on, which is why this was invisible until the addresses were listed side by side.
 
+### Known special addresses (`_ADRESSE_OVERRIDES`)
+
+Some addresses are written in a form no general normalisation can reach. The case this exists for is "Center for Børne- og Ungehjem", where the source puts the home's own name in front of the street:
+
+```
+Toppen, Årslev Møllevej 19, 8220 Brabrand
+```
+
+`Toppen` becomes the first comma-component — what the matcher takes for the street — so every prefix is built from it and nothing can match. What is wrong here is the *shape* of the string, not its spelling, so there is nothing for the component logic to work with.
+
+`_ADRESSE_OVERRIDES` maps a substring to the register's wording, and the whole address is replaced before parsing. The homes are a known, finite list, so naming them is both simpler and safer than guessing which leading components are not streets.
+
+Matched through `_fold`, so case, spacing and `æ/ø/å` versus `ae/oe/aa` all work — `Bostedet Toppen, Aarslev Moellevej 19` hits the same entry. Never across a longer house number, so `Årslev Møllevej 19` does not swallow `Årslev Møllevej 190`.
+
+Add a row to the tuple for each new home. The run log reports how many rows were rewritten.
+
 ### Initials in street names
 
 | source | register |
