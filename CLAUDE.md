@@ -331,7 +331,9 @@ The trailing comma is what makes a prefix safe: every `adresse_tekst` has one st
 
 ### Reading an unresolved address
 
-Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe drops the trailing comma the matcher's own searches all end in: that comma is what stops `Hørret Byvej 15,` matching `Hørret Byvej 150,`, but it also means that when the register has `15A` and no bare `15`, every search returns nothing and the log can only say `0`.
+Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe runs **only when nothing matched**, and it tries every street spelling the matcher itself tried — not just the source's raw wording. Probing the raw wording alone is how `Borresøvej 041` once reported the neighbours of `Borresøvej 10`: the padded street found nothing, so it fell straight through to the bare street name, where alphabetical order starts at 10, while `borresøvej 41` would have found the building. The bare street name is kept as a last resort, to answer "does this street exist at all".
+
+The probe drops the trailing comma the matcher's own searches all end in: that comma is what stops `Hørret Byvej 15,` matching `Hørret Byvej 150,`, but it also means that when the register has `15A` and no bare `15`, every search returns nothing and the log can only say `0`.
 
 A failure also reports **where CPR has that student living**, looked up in `LOIS.CPR.PersonGeoView` on `PNR_0` — the same view and the same key `rpa-befordring-nightly-runs` uses to resolve `Elev.adresse_id` every night — and turned into text through `GET /adresse/{adresse_id}`. For `Hørret Byvej 15` that is `15C`, which is the correction a caseworker would otherwise have looked up by hand, one student at a time.
 
@@ -343,8 +345,8 @@ Three signatures, and they say different things:
 
 | in the log | cause |
 |---|---|
-| `0 række(r)`, but `registret har` lists neighbours | **source data** — the address does not exist as written; the caseworker left something off |
-| `N række(r), N match` | **ambiguous** — the source does not say which flat |
+| `0 række(r)` on every search, then `registret har:` | **source data** — the address does not exist as written; the caseworker left something off |
+| `N række(r), N match`, then `passer lige godt:` | **ambiguous** — the address was found; the source just does not say which flat. The list is the candidates themselves, not a fresh probe of the street |
 | every search `0` *and* `registret har: intet`, usually with `tegn:` | **the string is broken** — a hidden character, or a street that is not there at all |
 
 ```

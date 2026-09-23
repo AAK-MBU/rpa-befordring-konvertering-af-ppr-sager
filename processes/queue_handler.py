@@ -473,12 +473,19 @@ def _probe_register(
     hint, not a failed conversion.
     """
 
-    street = source[0]
-    probes = [street]
+    # Every spelling the matcher itself tried, not just the raw one. Probing
+    # only the source's own wording is how "Borresøvej 041" ended up reporting
+    # the neighbours of Borresøvej 10: the raw street found nothing, so it fell
+    # straight through to the bare street name, where alphabetical order starts
+    # at 10 — while "borresøvej 41" would have found the building.
+    probes = list(_street_variants(source[0]))
 
-    uden_nummer = _HOUSE_NUMBER_TAIL.sub("", street).strip()
+    # Last resort only: the street with no house number at all. Answers "does
+    # this street even exist", at the cost of listing addresses that have
+    # nothing to do with the one being looked for.
+    uden_nummer = _HOUSE_NUMBER_TAIL.sub("", source[0]).strip()
 
-    if uden_nummer and uden_nummer != street:
+    if uden_nummer and uden_nummer not in probes:
         probes.append(uden_nummer)
 
     for probe in probes:
@@ -556,7 +563,9 @@ def _unresolved_line(
         linjer.append(f"      tegn         : {kilde!a}")
 
     if naboer:
-        linjer.append("      registret har:")
+        linjer.append(
+            "      passer lige godt:" if count > 1 else "      registret har:"
+        )
         linjer.extend(f"                     {n}" for n in naboer[:8])
 
         if len(naboer) > 8:
@@ -708,12 +717,29 @@ def _resolve_adresse_ids(
             tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
             continue
 
+        # Two different failures, two different things worth printing.
+        #
+        # Ambiguous (several matched): the candidates ARE the problem — the
+        # source does not say which of them it means — so they are what to
+        # show. Probing the street again would answer a question nobody asked.
+        #
+        # Nothing matched: there is nothing to show, so go and find out what
+        # the register does hold nearby.
+        if candidates:
+            naboer = [
+                candidate.get("adresse_tekst", "")
+                for candidate in candidates
+                if candidate.get("adresse_tekst")
+            ]
+        else:
+            naboer = _probe_register(api_endpoint, headers, source, postnummer)
+
         unresolved.append({
             "key": key,
             "kilde": kilder[key],
             "count": len(candidates),
             "forsoeg": forsoeg,
-            "naboer": _probe_register(api_endpoint, headers, source, postnummer),
+            "naboer": naboer,
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
         })
 
