@@ -342,6 +342,25 @@ Address resolution is the slow part of the queue phase — one or more API calls
 
 **Delete the file after changing the matching rules.** A cached hit skips the matcher completely, so an entry written under the old rules would survive the change meant to correct it.
 
+### CPR settles an ambiguity
+
+Several register rows fitting the source equally well often means the register holds both an access address and its unit address:
+
+```
+  Øster Kringelvej 25, 8250 Egå
+      søgte på : 'øster kringelvej 25,' → 2 række(r), 2 match
+      passer lige godt:
+                 Øster Kringelvej 25, 8250 Egå
+                 Øster Kringelvej 25, st., 8250 Egå
+```
+
+That is the same dwelling written twice, and no rule about the source text can separate them — the source says `25` and both rows are `25`. CPR can: it says which row the student is registered at. Where exactly one candidate is the student's own address, that one is taken, and the choice is logged by name.
+
+Deliberately narrow, in two ways:
+
+- **Only an ambiguity, never a miss.** Choosing among candidates that already matched keeps the answer consistent with the source. Where *nothing* matched, CPR's address is not among the candidates, and taking it would invent an address the source never supported — `Hørret Byvej 15` with CPR saying `15A` stays unresolved, because that is precisely the case a caseworker must look at.
+- **Only on agreement.** Several students can share one legacy address. If their CPR addresses point at different candidates, that is a new disagreement rather than an answer, and it stays unresolved with both shown.
+
 ### Reading an unresolved address
 
 Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe runs **only when nothing matched**, and it tries every street spelling the matcher itself tried — not just the source's raw wording. Probing the raw wording alone is how `Borresøvej 041` once reported the neighbours of `Borresøvej 10`: the padded street found nothing, so it fell straight through to the bare street name, where alphabetical order starts at 10, while `borresøvej 41` would have found the building. The bare street name is kept as a last resort, to answer "does this street exist at all".

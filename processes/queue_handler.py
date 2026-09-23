@@ -556,6 +556,54 @@ def _probe_register(
     return []
 
 
+def _vaelg_via_cpr(
+    entry: dict,
+    lois_adresse_id: dict[str, str],
+) -> tuple[str, str] | None:
+    """Settle an ambiguous address with CPR, or None when it cannot be settled.
+
+    Several register rows fitting the source equally well usually means the
+    register holds both an access address and its unit address — "Øster
+    Kringelvej 25" and "Øster Kringelvej 25, st." are the same dwelling
+    written twice — and no rule about the source text can separate them. CPR
+    can: it says which row the student is actually registered at.
+
+    Deliberately narrow:
+
+      only an AMBIGUITY, never a miss   picking from candidates that already
+                                        matched keeps the answer consistent
+                                        with the source. Where nothing
+                                        matched, CPR's address is not among
+                                        them, and taking it would invent an
+                                        address the source never supported —
+                                        exactly the case a caseworker must
+                                        look at.
+
+      only on agreement                 several students can share one legacy
+                                        address. If their CPR addresses point
+                                        at different candidates, that is a new
+                                        disagreement, not an answer.
+    """
+
+    kandidater = dict(entry.get("kandidater") or [])
+
+    if len(kandidater) < 2:
+        return None
+
+    valgte = {
+        lois_adresse_id[cpr]
+        for cpr in entry.get("cprs") or []
+        if lois_adresse_id.get(cpr) in kandidater
+    }
+
+    if len(valgte) != 1:
+        return None
+
+    adresse_id = valgte.pop()
+
+    return adresse_id, kandidater[adresse_id]
+
+
 def _unresolved_line(
     key: tuple[str, ...],
     kilde: str,
@@ -564,6 +612,7 @@ def _unresolved_line(
     naboer: list[str],
     cprs: list[str] | None = None,
     lois: list[tuple[str, str]] | None = None,
+    kandidater: list[tuple[str, str]] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -897,20 +946,14 @@ def _resolve_adresse_ids(
             "forsoeg": forsoeg,
             "naboer": naboer,
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
+            # Kept so an ambiguity can still be settled by CPR below. Ids, not
+            # just the texts _unresolved_line prints.
+            "kandidater": [
+                (c["adresse_id"], c.get("adresse_tekst") or "")
+                for c in candidates
+                if c.get("adresse_id")
+            ],
         })
-
-    if cache_fil is not None:
-        cache_fil.close()
-
-    logger.info(
-        "Resolved %d/%d distinct bevilling address(es) against the Adresse "
-        "table (%d from %s, %d looked up).\n",
-        len(resolved),
-        len(keys),
-        fra_cache,
-        _cache_path() or "cache",
-        len(resolved) - fra_cache,
-    )
 
     if unresolved:
         # Where CPR has these students living, for the caseworker who has to
@@ -938,6 +981,66 @@ def _resolve_adresse_ids(
                 if cpr in lois_adresse_id
             ]
 
+        # Settle what CPR can settle.
+        #
+        # An ambiguity means several register rows fit the source equally
+        # well, and the source does not say which. Where the register holds
+        # both an access address and its unit address — "Øster Kringelvej 25"
+        # and "Øster Kringelvej 25, st." — that is the same dwelling written
+        # twice, and no rule about the source text can separate them.
+        #
+        # CPR can: it says which of those rows the student is registered at.
+        # Only ever used to choose BETWEEN candidates that already matched, so
+        # the result is always an address consistent with the source, and only
+        # when the CPRs behind the address agree on one. It never overrides a
+        # clean single match and never invents one where nothing matched.
+        stadig_uloeste = []
+
+        for entry in unresolved:
+            valgt = _vaelg_via_cpr(entry, lois_adresse_id)
+
+            if valgt is None:
+                stadig_uloeste.append(entry)
+                continue
+
+            adresse_id, adresse_tekst = valgt
+
+            resolved[entry["key"]] = adresse_id
+            tekster[adresse_id] = adresse_tekst
+
+            if cache_writer is not None:
+                cache_writer.writerow([
+                    json.dumps(list(entry["key"]), ensure_ascii=False),
+                    adresse_id,
+                    adresse_tekst,
+                    entry["kilde"],
+                ])
+                cache_fil.flush()
+
+            logger.info(
+                "  %s: %d adresser passede lige godt — valgt %r, fordi CPR "
+                "har eleven boende der.\n",
+                entry["kilde"],
+                entry["count"],
+                adresse_tekst,
+            )
+
+        unresolved = stadig_uloeste
+
+    if cache_fil is not None:
+        cache_fil.close()
+
+    logger.info(
+        "Resolved %d/%d distinct bevilling address(es) against the Adresse "
+        "table (%d from %s, %d looked up).\n",
+        len(resolved),
+        len(keys),
+        fra_cache,
+        _cache_path() or "cache",
+        len(resolved) - fra_cache,
+    )
+
+    if unresolved:
         logger.warning(
             "%d address(es) unresolved — the bevillinger using them will be "
             "rejected for manual follow-up:\n%s\n",

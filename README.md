@@ -82,6 +82,12 @@ Alle kald autentificeres med `X-API-Key`.
 | nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
+## Når CPR afgør en flertydig adresse
+
+Registret har tit både adgangsadressen og enhedsadressen — `Øster Kringelvej 25` og `Øster Kringelvej 25, st.` er samme bolig skrevet to gange — og kilden siger `25`, hvilket passer på begge. Her slår robotten op i CPR: passer præcis én af kandidaterne med elevens egen adresse, vælges den, og valget skrives i loggen med adressens navn.
+
+Det sker kun ved flertydighed, aldrig når intet passede: ville man tage CPR-adressen dér, opfandt man en adresse, kilden ikke bakker op om. Og kun når de elever, der deler adressen, peger på den samme kandidat.
+
 ## Cache af opslåede adresser
 
 Adresseopslaget er den langsomme del af kø-fasen, og langt de fleste af de ~3700 rækker rammer plet første gang. Derfor gemmes hvert vellykket opslag i `resolved_addresses.csv`, som næste kørsel læser først — så en gentagen kørsel, der kun skal se på de få fejlende adresser, ikke betaler for alle de andre igen.
