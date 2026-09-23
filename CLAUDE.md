@@ -328,6 +328,31 @@ A source with no floor/door still matches every flat at that number, which is co
 
 The trailing comma is what makes a prefix safe: every `adresse_tekst` has one straight after the house number, so `"Kærlundvej 16,"` matches `"Kærlundvej 16, Ormslev, ..."` but not `"Kærlundvej 160, ..."` or `"Kærlundvej 16A, ..."`.
 
+### Reading an unresolved address
+
+Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe drops the trailing comma the matcher's own searches all end in: that comma is what stops `Hørret Byvej 15,` matching `Hørret Byvej 150,`, but it also means that when the register has `15A` and no bare `15`, every search returns nothing and the log can only say `0`.
+
+Three signatures, and they say different things:
+
+| in the log | cause |
+|---|---|
+| `0 række(r)`, but `registret har` lists neighbours | **source data** — the address does not exist as written; the caseworker left something off |
+| `N række(r), N match` | **ambiguous** — the source does not say which flat |
+| every search `0` *and* `registret har: intet`, usually with `tegn:` | **the string is broken** — a hidden character, or a street that is not there at all |
+
+```
+  Hørret Byvej 15, 8320 Mårslet
+      normaliseret : hørret byvej 15 | 8320 mårslet
+      søgte på     : 'hørret byvej 15,' → 0 række(r), 0 match
+      registret har:
+                     Hørret Byvej 15A, 8320 Mårslet
+                     Hørret Byvej 15C, 8320 Mårslet
+                     Hørret Byvej 15D, 8320 Mårslet
+      => adressen findes ikke som skrevet; se ovenstående
+```
+
+`tegn:` is a repr, added only when the source holds a character a Danish address is not written with — a zero-width space, a soft hyphen or a decomposed `å` breaks matching while looking perfectly normal on screen.
+
 ### The search must be narrowed to the postcode
 
 `Adresse` is the whole of Denmark — the nightly import reads `LOIS.DAR.AdresseDkGeoView` with no municipality filter, ~4M rows. `/adresse/search` orders alphabetically, and on a string whose next characters are the postcode that means the rows falling off the end of the limit are the ones with the **highest** postcodes. Searching `"Bøgebakken 2,"` returns Greve, Roskilde and Køge, and `8462 Harlev J` is never seen.

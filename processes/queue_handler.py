@@ -311,32 +311,132 @@ def _search_prefixes(source: list[str]) -> list[str]:
     return _dedupe(prefixes)
 
 
-def _unresolved_line(key: tuple[str, ...], count: int, prefixes: list[str]) -> str:
-    """One line per address that could not be resolved, with enough to act on.
+# What a source address looks like once the house number is taken off, so the
+# register can be probed for the street itself: "hørret byvej 15" -> "hørret byvej".
+_HOUSE_NUMBER_TAIL = re.compile(r"\s*\d+\s*[a-zæøå]?$")
 
-    Three things, because "0 candidate(s)" on its own is not diagnosable:
 
-      the address        as the matcher normalised it
-      the prefixes tried the exact searches that came back empty, which can be
-                         pasted straight into the address field to see what the
-                         register does have
-      a repr             ONLY when the text contains a character a Danish
-                         address is not written with. A zero-width space, a
-                         soft hyphen or an NFD "å" breaks matching while
-                         looking perfectly normal on screen, and without the
-                         repr there is nothing to see.
+def _probe_register(
+    api_endpoint: str,
+    headers: dict,
+    source: list[str],
+    postnummer: str | None,
+) -> list[str]:
+    """What the register actually holds near an address that would not resolve.
+
+    Diagnostic only, and only for addresses that already failed, so it costs
+    one extra request per failure and none at all on a clean run.
+
+    The searches the matcher runs all end in a comma — that is what stops
+    "Hørret Byvej 15," matching "Hørret Byvej 150," — which also means that
+    when the register has 15A but no bare 15, every one of them returns
+    nothing and the log can only say "0". Dropping the comma asks the far more
+    useful question: what IS there? For that address the answer is 15A, 15C
+    and 15D, which turns "could not be matched" into "the caseworker left the
+    letter off".
+
+    Falls back to the street without its house number, so a wrong number still
+    shows the street exists. Never raises: a failed probe means one missing
+    hint, not a failed conversion.
     """
 
-    tekst = ", ".join(key)
-    line = f"  {tekst} — {count} candidate(s)"
+    street = source[0]
+    probes = [street]
 
-    if count == 0:
-        line += f"\n      søgte på: {' | '.join(prefixes)}"
+    uden_nummer = _HOUSE_NUMBER_TAIL.sub("", street).strip()
 
-    if _SUSPECT_CHARS.search(tekst):
-        line += f"\n      tegn:     {tekst!a}"
+    if uden_nummer and uden_nummer != street:
+        probes.append(uden_nummer)
 
-    return line
+    for probe in probes:
+        if len(probe) < 2:
+            continue
+
+        try:
+            response = requests.get(
+                f"{api_endpoint}/adresse/search",
+                params={"q": probe, "postnummer": postnummer, "limit": 25},
+                headers=headers,
+                timeout=30,
+            )
+
+            if not response.ok:
+                continue
+
+            fundet = [
+                row.get("adresse_tekst")
+                for row in (response.json() or [])
+                if row.get("adresse_tekst")
+            ]
+
+            if fundet:
+                return fundet
+        except requests.RequestException:
+            continue
+
+    return []
+
+
+def _unresolved_line(
+    key: tuple[str, ...],
+    kilde: str,
+    count: int,
+    forsoeg: list[tuple[str, int, int]],
+    naboer: list[str],
+) -> str:
+    """One block per address that could not be resolved, with enough to act on.
+
+    "0 candidate(s)" is not diagnosable. Nor is the normalised text on its own:
+    it hides how the address was written, and says nothing about what was
+    looked for or what the register had instead. So the block carries the
+    source verbatim, every search that was run with what it returned, and the
+    addresses that actually exist on that street.
+
+    That is what separates the two kinds of failure. A matcher that cannot
+    cope with the spelling shows searches returning rows that were then
+    rejected; bad source data shows searches returning nothing while the
+    register plainly holds the neighbours.
+
+    A repr is added ONLY when the text contains a character a Danish address is
+    not written with — a zero-width space, a soft hyphen or a decomposed "å"
+    breaks matching while looking perfectly normal on screen, and without it
+    there is nothing to see.
+    """
+
+    normaliseret = " | ".join(key)
+
+    linjer = [
+        f"  {kilde}",
+        f"      normaliseret : {normaliseret}",
+    ]
+
+    for prefix, raekker, matchede in forsoeg:
+        linjer.append(
+            f"      søgte på     : {prefix!r} → {raekker} række(r), {matchede} match"
+        )
+
+    # Only the source. normaliseret is joined with " | ", and the pipe would
+    # trip the check on every single failure.
+    if _SUSPECT_CHARS.search(kilde):
+        linjer.append(f"      tegn         : {kilde!a}")
+
+    if naboer:
+        linjer.append("      registret har:")
+        linjer.extend(f"                     {n}" for n in naboer[:8])
+
+        if len(naboer) > 8:
+            linjer.append(f"                     … og {len(naboer) - 8} flere")
+    else:
+        linjer.append("      registret har: intet på den vej i det postnummer")
+
+    if count > 1:
+        linjer.append(
+            f"      => {count} adresser passer lige godt — kilden siger ikke hvilken"
+        )
+    elif naboer:
+        linjer.append("      => adressen findes ikke som skrevet; se ovenstående")
+
+    return "\n".join(linjer)
 
 
 def _resolve_adresse_ids(
@@ -372,17 +472,32 @@ def _resolve_adresse_ids(
     api_endpoint, api_key = get_api_credentials()
     headers = {"X-API-Key": api_key}
 
-    keys = {key for key in (_address_key(row) for row in rows) if key}
+    # key -> the address as BefordringsData wrote it. The key alone is the
+    # normalised form, which is not what a caseworker would recognise and hides
+    # exactly the punctuation a failure usually turns on.
+    kilder: dict[tuple[str, ...], str] = {}
+
+    for row in rows:
+        key = _address_key(row)
+
+        if key and key not in kilder:
+            kilder[key] = " ".join(str(row.get("ElevensAdresse") or "").split())
+
+    keys = set(kilder)
 
     resolved: dict[tuple[str, ...], str] = {}
     # adresse_id -> the register's own spelling, so the queue log can show what
     # each source address actually matched rather than a bare GUID.
     tekster: dict[str, str] = {}
-    unresolved: list[tuple[tuple[str, ...], int, list[str]]] = []
+    unresolved: list[tuple] = []
 
     for key in sorted(keys):
         source = list(key)
         candidates: list[dict] = []
+        # (prefix, rows the register returned, rows that then matched) — the
+        # difference between the last two is what says whether the matcher or
+        # the source data is at fault.
+        forsoeg: list[tuple[str, int, int]] = []
 
         # Always sent with the search. Adresse is the whole of Denmark — the
         # nightly import reads AdresseDkGeoView with no municipality filter —
@@ -412,11 +527,15 @@ def _resolve_adresse_ids(
                     f"{response.status_code} — {response.text}"
                 )
 
+            raekker = response.json() or []
+
             candidates = [
                 candidate
-                for candidate in (response.json() or [])
+                for candidate in raekker
                 if _matches(candidate.get("adresse_tekst"), source)
             ]
+
+            forsoeg.append((prefix, len(raekker), len(candidates)))
 
             if candidates:
                 break
@@ -426,7 +545,13 @@ def _resolve_adresse_ids(
             tekster[candidates[0]["adresse_id"]] = candidates[0].get("adresse_tekst") or ""
             continue
 
-        unresolved.append((key, len(candidates), _search_prefixes(source)))
+        unresolved.append((
+            key,
+            kilder[key],
+            len(candidates),
+            forsoeg,
+            _probe_register(api_endpoint, headers, source, postnummer),
+        ))
 
     logger.info(
         "Resolved %d/%d distinct bevilling address(es) against the Adresse table.\n",
@@ -439,8 +564,7 @@ def _resolve_adresse_ids(
             "%d address(es) unresolved — the bevillinger using them will be "
             "rejected for manual follow-up:\n%s\n",
             len(unresolved),
-            "\n".join(_unresolved_line(key, count, prefixes)
-                      for key, count, prefixes in unresolved),
+            "\n".join(_unresolved_line(*entry) for entry in unresolved),
         )
 
     return resolved, tekster
