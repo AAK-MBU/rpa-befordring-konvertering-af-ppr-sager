@@ -89,7 +89,7 @@ _PADDED_NUMBER = re.compile(r"\b0+(\d{1,2})\b")
 # "Egå Mosevej 31 c" into a street and a stray "c", breaking the house-letter
 # case. A component with nothing after the house number is left alone.
 _STREET_THEN_FLOOR = re.compile(
-    r"^(.*?\d+\s?[a-zæøå]?)\s+((?:\d+|st|kl|kld)\b.*)$"
+    r"^(.*?\d+\s?[a-zæøå]?)(?:\s*\.\s*|\s+)((?:\d+|st|kl|kld)\b.*)$"
 )
 
 # "1. sal" and "1." are the same floor; the source writes it out and the
@@ -483,7 +483,9 @@ def _rewrite_until_stable(pattern: re.Pattern, replacement: str, tekst: str) -> 
 
 # "1 th" / "1. th" / "st tv" / "st. tv" — a floor token, with or without its
 # period. kl and kld are kælder (basement).
-_FLOOR_PREFIX = re.compile(r"^(\d+|st|kl|kld)\.?\s+(.*)$")
+# Either a period or whitespace must follow the floor token, so a bare door
+# number like "12" is not read as floor 1 door 2.
+_FLOOR_PREFIX = re.compile(r"^(\d+|st|kl|kld)(?:\.\s*|\s+)(.+)$")
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -512,6 +514,10 @@ def _street_variants(street: str) -> list[str]:
 
     varianter = [
         street,
+        # "Holme Byvej 42." — a stray period after the house number breaks the
+        # prefix, while _canon quietly removes it, so the comparison would
+        # have matched a row the search never returns.
+        street.rstrip(". ,"),
         _HOUSE_LETTER_SPACED.sub(r"\1\2", street),
         _HOUSE_LETTER_JOINED.sub(r"\1 \2", street),
     ]
@@ -598,7 +604,7 @@ def _search_prefixes(source: list[str]) -> list[str]:
 
 # What a source address looks like once the house number is taken off, so the
 # register can be probed for the street itself: "hørret byvej 15" -> "hørret byvej".
-_HOUSE_NUMBER_TAIL = re.compile(r"\s*\d+\s*[a-zæøå]?$")
+_HOUSE_NUMBER_TAIL = re.compile(r"\s*\d+\s*[a-zæøå]?\.?$")
 
 
 def _cpr_cifre(cpr) -> str:
@@ -818,6 +824,65 @@ def _vaelg_via_cpr(
     return adresse_id, kandidater[adresse_id]
 
 
+def _alfanumerisk(tekst: str | None) -> str:
+    """Letters and digits only, casefolded. Every separator dropped.
+
+    Blunter than _canon, which keeps hyphens and anything else that is not a
+    space or a period. Used for one comparison only — source against the
+    student's own registered address — where the two are either the same
+    address or not remotely close, and no separator carries meaning.
+    """
+
+    return "".join(c for c in str(tekst or "").casefold() if c.isalnum())
+
+
+def _vaelg_via_flad_cpr(
+    entry: dict,
+    lois_adresse_id: dict[str, str],
+    lois_tekst: dict[str, str],
+) -> tuple[str, str] | None:
+    """Match the source straight against the student's registered address.
+
+        source   Haurumsvej 13.1.th, 8381 Tilst
+        CPR      Haurumsvej 13, 1. th, 8381 Tilst
+
+    Letters and digits only, both sides: `haurumsvej131th8381tilst`. The same
+    address, written with the separators in different places.
+
+    This is the one fallback that does not depend on the search. Every other
+    step works on rows the register returned, and when the source's street
+    component is mangled — a floor glued on with periods, say — the search
+    returns nothing and there is no pool to choose from. Here there is nothing
+    to search for: the source and a known address are simply the same string.
+
+    Strong enough to run before the pool-based CPR step and the coordinate
+    guess, and only on a true miss, where nothing matched on text. Requires
+    the CPRs behind the address to agree, like the others.
+    """
+
+    if entry.get("count"):
+        return None
+
+    kilde = _alfanumerisk(entry.get("kilde"))
+
+    if not kilde:
+        return None
+
+    valgte = {
+        adresse_id
+        for cpr in entry.get("cprs") or []
+        if (adresse_id := lois_adresse_id.get(cpr))
+        and _alfanumerisk(lois_tekst.get(adresse_id)) == kilde
+    }
+
+    if len(valgte) != 1:
+        return None
+
+    adresse_id = valgte.pop()
+
+    return adresse_id, lois_tekst.get(adresse_id) or ""
+
+
 def _vaelg_via_cpr_uden_match(
     entry: dict,
     lois_adresse_id: dict[str, str],
@@ -1004,8 +1069,16 @@ def _er_i_praksis_samme(kilde: str | None, register: str | None) -> bool:
     if not kilde_led:
         return False
 
-    # Subsequence, so extra parts in the register are free and missing ones
-    # are not — the same rule _matches uses, on a blunter comparison.
+    # Commas out as well as spaces and periods. A comma in the wrong place is
+    # still only punctuation: "Haurumsvej 13.1.th" and "Haurumsvej 13, 1. th"
+    # are the same string once all three are gone, so splitting the floor off
+    # the street told us nothing we could have got wrong.
+    if "".join(kilde_led) == "".join(_naive_led(register)):
+        return True
+
+    # Otherwise the parts must line up, with extras in the register free and
+    # missing ones not — the same subsequence rule _matches uses, on a
+    # blunter comparison. This is the "register knows the place name" case.
     resten = iter(_naive_led(register))
 
     return all(led in resten for led in kilde_led)
@@ -1581,6 +1654,25 @@ def _resolve_adresse_ids(
                 note = _cpr_valg_note(entry["kilde"], entry["count"], valgt[1])
 
             if valgt is None:
+                # First among the miss handlers: the source and the student's
+                # registered address are the same string once separators are
+                # dropped. No search involved, so it works even where the
+                # street component was mangled badly enough that nothing came
+                # back at all.
+                valgt = _vaelg_via_flad_cpr(entry, lois_adresse_id, lois_tekst)
+
+                if valgt is not None:
+                    metode = "cpr-flad"
+                    # Same rule as an ordinary match: a comment only where
+                    # something was actually inferred. Two strings that differ
+                    # only in punctuation are not an inference.
+                    note = (
+                        ""
+                        if _er_i_praksis_samme(entry["kilde"], valgt[1])
+                        else _generel_adresse_note(entry["kilde"], valgt[1])
+                    )
+
+            if valgt is None:
                 # Then CPR again, for a miss rather than an ambiguity: the
                 # source's floor and door match nothing, but CPR names a row
                 # at the same street and house number. A correction rather
@@ -1632,6 +1724,13 @@ def _resolve_adresse_ids(
                     entry["count"],
                     adresse_tekst,
                 )
+            elif metode == "cpr-flad":
+                logger.info(
+                    "  %s: ingen søgning ramte, men kilden er tegn for tegn "
+                    "elevens registrerede adresse %r — valgt.\n",
+                    entry["kilde"],
+                    adresse_tekst,
+                )
             elif metode == "cpr-korrektion":
                 logger.warning(
                     "  %s: etage/dør findes ikke i registret — valgt %r, hvor "
@@ -1679,8 +1778,26 @@ def _resolve_adresse_ids(
 
 # Places whose appearance in ElevensAdresse or SkoleNavnBefordring means the
 # row is really about club transport — see _klub_note.
+# What makes a row "klub-related". Matched through _fold, so case, spacing and
+# æ/ø/å versus ae/oe/aa all hit — "Søndergaard" and "Søndergård" are one entry.
+#
+# "klub" alone is deliberate: the source writes Klubben, klubben, ungdomsklub
+# and more, and over-matching costs only a comment. Bare "holme" is
+# deliberately NOT here — Holmevej, Holme Ringvej and Holmesvinget are
+# ordinary Aarhus streets, and matching them would drag every student living
+# in Holme onto the klub path.
 _KLUB_MARKERS: tuple[str, ...] = (
-    "Klubben Holme Søndergård",
+    "klub",
+    "Holme Søndergård",
+)
+
+# The fields a klub can turn up in. ElevensAdresse and SkoleNavnBefordring
+# because the old system had no klub kørsel and those two columns were used to
+# stand in for it; Kommentar because a caseworker often just wrote it there.
+_KLUB_FELTER: tuple[str, ...] = (
+    "ElevensAdresse",
+    "SkoleNavnBefordring",
+    "Kommentar",
 )
 
 
@@ -1700,33 +1817,65 @@ def _fold(value: str | None) -> str:
     return folded
 
 
-def _klub_note(row: dict) -> str | None:
-    """A note preserving the raw address and school, when a row means "klub".
+def _naevner_klub(*vaerdier) -> bool:
+    """Whether any of these values mentions a klub."""
 
-    Befordring to and from a klub does not exist in the old system, but does
-    here. To record it anyway, caseworkers put the klub in ElevensAdresse and
-    the student's home in SkoleNavnBefordring — or the reverse for the return
-    trip. The row therefore describes a journey its own columns misname, and
-    no automatic conversion can recover which was which.
+    haystack = "\x00".join(_fold(v) for v in vaerdier)
 
-    So the values are carried across verbatim in the kørselsrække's comment.
-    A caseworker reading it can see what the row actually said and rebuild the
-    klub kørsel properly; without it, the only trace is a bevilling whose
-    address looks wrong.
+    return any(_fold(marker) in haystack for marker in _KLUB_MARKERS)
+
+
+def _klub_i_adressen(row: dict) -> bool:
+    """Whether THIS row's ElevensAdresse is a klub rather than a home.
+
+    Separate from _klub_relevant because the two are used for different
+    things. A row naming the klub in SkoleNavnBefordring is the return trip:
+    its ElevensAdresse is the student's home and is a perfectly good address
+    for the bevilling. A row naming it in ElevensAdresse is not, and must not
+    be allowed to become the bevilling's address.
     """
 
-    adresse = row.get("ElevensAdresse")
-    skole = row.get("SkoleNavnBefordring")
+    return _naevner_klub(row.get("ElevensAdresse"))
 
-    haystack = _fold(adresse) + "\x00" + _fold(skole)
 
-    if not any(_fold(marker) in haystack for marker in _KLUB_MARKERS):
-        return None
+def _klub_relevant(row: dict) -> bool:
+    """Whether a klub is involved in this row at all, in any of the fields."""
+
+    return _naevner_klub(*(row.get(felt) for felt in _KLUB_FELTER))
+
+
+def _klub_note(row: dict, adresse_tekst: str | None) -> str:
+    """The comment left on every kørselsrække of a klub-related bevilling.
+
+    The old system had no klub kørsel. To record it anyway, caseworkers wrote
+    the klub into whichever field was to hand — ElevensAdresse, with the home
+    in SkoleNavnBefordring, or the reverse for the return trip, or simply a
+    line in Kommentar. The row therefore describes a journey its own columns
+    misname, and nothing automatic can recover which was which.
+
+    So the bevilling is put on the STUDENT'S address, never the klub's, and
+    every kørselsrække carries this note: the raw values verbatim, so a
+    caseworker can see what the row actually said, and a plain statement that
+    the befordring must be corrected by hand.
+
+    On every kørselsrække in the bevilling, not only the ones that mention
+    the klub, because it is the bevilling as a whole that needs rebuilding.
+    """
+
+    linjer = [
+        f"{felt}: {str(row.get(felt) or '').strip() or '(tom)'}"
+        for felt in _KLUB_FELTER
+    ]
 
     return _konverterings_note(
-        "klub i kildedata",
-        f"ElevensAdresse: {str(adresse or '').strip()}",
-        f"SkoleNavnBefordring: {str(skole or '').strip()}",
+        "klub kan indgå i befordringen",
+        "Kilde (denne kørselsrække):",
+        *[f"  {linje}" for linje in linjer],
+        f"Bevillingen er oprettet på elevens egen adresse: "
+        f"{adresse_tekst or '(ukendt)'}",
+        "Det gamle system havde ikke klubkørsel, så klubben er skrevet ind i "
+        "felterne ovenfor. Ret bevillingen manuelt, så den afspejler den "
+        "faktiske befordring.",
     )
 
 
@@ -1873,35 +2022,47 @@ def retrieve_items_for_queue() -> list[dict]:
     # Only for rows that FAILED. A closed case whose address resolves normally
     # is converted normally.
     lukkede_sager = _load_lukkede_sager()
-    lukket_adresse: dict[str, tuple[str, str]] = {}
 
-    if lukkede_sager:
-        mangler = {
-            _cpr_cifre(row.get("CPR"))
-            for row in rows
-            if str(row.get("CaseID") or "").strip() in lukkede_sager
-            and (_address_key(row) or ()) not in adresse_ids
-        }
+    # cpr -> (adresse_id, tekst) from LOIS, for students whose bevilling may
+    # have to fall back on their own address. Two reasons to need one:
+    #
+    #   a closed case whose address will not resolve, and
+    #   a klub row, where ElevensAdresse is the klub rather than a home and
+    #   no other row in the case supplies a usable address.
+    #
+    # One lookup covering both, since it is the same view and the same key.
+    elev_adresse: dict[str, tuple[str, str]] = {}
 
-        mangler.discard("")
+    def _uden_adresse(row: dict) -> bool:
+        return (_address_key(row) or ()) not in adresse_ids
 
-        if mangler:
-            api_endpoint, api_key = get_api_credentials()
-            headers = {"X-API-Key": api_key}
+    behov = {
+        _cpr_cifre(row.get("CPR"))
+        for row in rows
+        if (
+            (str(row.get("CaseID") or "").strip() in lukkede_sager and _uden_adresse(row))
+            or _klub_relevant(row)
+        )
+    }
 
-            for cpr, adresse_id in _lois_adresser(sorted(mangler)).items():
-                tekst = _adresse_tekst(api_endpoint, headers, adresse_id)
+    behov.discard("")
 
-                if tekst:
-                    lukket_adresse[cpr] = (adresse_id, tekst)
+    if behov:
+        api_endpoint, api_key = get_api_credentials()
+        headers = {"X-API-Key": api_key}
 
-            logger.info(
-                "%d student(s) on a closed case have an address that will not "
-                "resolve; %d of them could be placed on their current address "
-                "from LOIS.\n",
-                len(mangler),
-                len(lukket_adresse),
-            )
+        for cpr, adresse_id in _lois_adresser(sorted(behov)).items():
+            tekst = _adresse_tekst(api_endpoint, headers, adresse_id)
+
+            if tekst:
+                elev_adresse[cpr] = (adresse_id, tekst)
+
+        logger.info(
+            "%d student(s) may need their own address from LOIS (closed case "
+            "with no match, or a klub row); %d of them could be resolved.\n",
+            len(behov),
+            len(elev_adresse),
+        )
 
     today = date.today()
     window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
@@ -1927,6 +2088,7 @@ def retrieve_items_for_queue() -> list[dict]:
     items = []
     ambiguous_cases: list[str] = []
     klub_rows = 0
+    klub_bevillinger = 0
     noterede_rows = 0
     lukkede_konverteret = 0
 
@@ -1962,6 +2124,11 @@ def retrieve_items_for_queue() -> list[dict]:
             #
             # Only when NO row in the bevilling resolved: one that did gives a
             # real address, and that is always better than a substitute.
+            # A klub anywhere in the bevilling's rows — address, school or
+            # comment. The bevilling then goes on the STUDENT'S address and
+            # every kørselsrække says the befordring needs rebuilding.
+            klub_bevilling = any(_klub_relevant(r) for r in bev_rows)
+
             lukket_id = None
             lukket_note = None
 
@@ -1969,7 +2136,7 @@ def retrieve_items_for_queue() -> list[dict]:
                 str(ppr_case_id).strip() in lukkede_sager
                 and not any((_address_key(r) or ()) in adresse_ids for r in bev_rows)
             ):
-                fallback = lukket_adresse.get(_cpr_cifre(person_ssn))
+                fallback = elev_adresse.get(_cpr_cifre(person_ssn))
 
                 if fallback:
                     lukket_id, lukket_tekst = fallback
@@ -2004,13 +2171,6 @@ def retrieve_items_for_queue() -> list[dict]:
                     for col, val in row.items()
                     if col in _KOERSELSRAEKKE_FIELDS
                 }
-
-                note = _klub_note(row)
-
-                if note:
-                    klub_rows += 1
-
-                koersel["Kommentar"] = _extend_kommentar(koersel.get("Kommentar"), note)
 
                 # Where this row's address was only resolved by assuming a
                 # floor the source never recorded, the kørselsrække says so.
@@ -2056,6 +2216,12 @@ def retrieve_items_for_queue() -> list[dict]:
                 key = _address_key(row)
                 kandidat = adresse_ids.get(key) if key else None
 
+                # A row whose ElevensAdresse IS the klub must never supply the
+                # bevilling's address. Its sibling rows — the return trip,
+                # where the home sits in ElevensAdresse — still can.
+                if kandidat and _klub_i_adressen(row):
+                    kandidat = None
+
                 if kandidat and kandidat not in bevilling_adresse_kandidater:
                     bevilling_adresse_kandidater.append(kandidat)
 
@@ -2067,6 +2233,17 @@ def retrieve_items_for_queue() -> list[dict]:
             # The fallback, and what process_item checks to reject a case whose
             # address could not be matched at all. bevilling_creation overrides
             # it with whichever candidate matches the student's own address.
+            # A klub bevilling with nothing usable left: the student's own
+            # address from LOIS. Better than no bevilling at all, and the
+            # note below says plainly that it is a placeholder.
+            # A klub bevilling with nothing usable left — every row named the
+            # klub in ElevensAdresse. The student's own address from LOIS is
+            # better than no bevilling, and the note says it is a placeholder.
+            reserve = elev_adresse.get(_cpr_cifre(person_ssn))
+
+            if klub_bevilling and not bevilling_adresse_kandidater and reserve:
+                bevilling_adresse_kandidater = [reserve[0]]
+
             if not bevilling_adresse_kandidater and lukket_id:
                 bevilling_adresse_kandidater = [lukket_id]
 
@@ -2075,6 +2252,24 @@ def retrieve_items_for_queue() -> list[dict]:
                 if bevilling_adresse_kandidater
                 else None
             )
+
+            # Written here rather than in the loop above, because the note
+            # names the address the bevilling ended up on and that is only
+            # known now. One per kørselsrække, carrying that row's own raw
+            # values — koerselsraekker and bev_rows are built one for one.
+            if klub_bevilling:
+                klub_tekst = (
+                    adresse_tekster.get(bevilling_adresse_id)
+                    or (reserve[1] if reserve else None)
+                )
+
+                for koersel, row in zip(koerselsraekker, bev_rows):
+                    koersel["Kommentar"] = _extend_kommentar(
+                        koersel.get("Kommentar"), _klub_note(row, klub_tekst)
+                    )
+                    klub_rows += 1
+
+                klub_bevillinger += 1
 
             # The earliest date the bevilling's kørsel starts. Two jobs:
             # it is the value the application's own "ny bevilling" flow seeds
@@ -2166,13 +2361,15 @@ def retrieve_items_for_queue() -> list[dict]:
         len(items),
     )
 
-    if klub_rows:
-        logger.info(
-            "%d kørselsrække(r) mention a klub in ElevensAdresse or "
-            "SkoleNavnBefordring. The old system had no klub kørsel, so those "
-            "columns were used to stand in for it — the raw values are "
-            "carried across in the comment for a caseworker to rebuild "
-            "from.\n",
+    if klub_bevillinger:
+        logger.warning(
+            "%d bevilling(er) over %d kørselsrække(r) mention a klub in "
+            "ElevensAdresse, SkoleNavnBefordring or Kommentar. The old system "
+            "had no klub kørsel, so those fields were used to stand in for "
+            "it. Each is placed on the STUDENT'S address — never the klub's — "
+            "and every kørselsrække carries the raw values plus a note that "
+            "the befordring must be rebuilt by hand.\n",
+            klub_bevillinger,
             klub_rows,
         )
 

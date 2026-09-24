@@ -63,6 +63,29 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 
 Every call authenticates with `X-API-Key` from `API_KEY`.
 
+### Schools split across two sites
+
+Five schools run on two sites under **one skolekode**:
+
+```
+Stensagerskolen (Janesvej)          751903
+Stensagerskolen (Stensagervej)      751903
+Kaløvigskolen (Sanatorievej)        751020
+Kaløvigskolen (Skovager)            751020
+Langagerskolen (Bøgeskov Høvej)     751090
+Langagerskolen (Kolt Østervej)      751090
+Tranbjergskolen (Grønløkke Allé)    280458
+Tranbjergskolen (Kirketorvet)       280458
+Vestergårdsskolen (Nordbyvej)       751050
+Vestergårdsskolen (Stensagervej)    751050
+```
+
+`SkoleID` alone therefore does **not** identify a matrikel. `_vaelg_matrikel` tells the sites apart on the street in `SkolensAdresse`, matched against the site name the lookup label carries in parentheses — `Stensagervej 11` against `Stensagerskolen (Stensagervej)`. Compared through `_normalise`, so spacing and case do not matter and `Bøgeskov Høvej` finds `Bøgeskov Høvej 10`. `SkoleNavnBefordring` is tried too, because the source sometimes names the site there instead: `Stensagerskolen (afd. Stensagervej)`.
+
+An unknown skolekode still yields no matrikel, exactly as before. A known one whose site cannot be told apart **raises** and the case goes to `pending_user` — a wrong school is worse than a stopped case.
+
+This was a live bug: `skolematrikel_map` was a dict keyed on skolekode, so the last entry won, and the lookup is ordered by `matrikel_navn`. Every `751903` student was being given `Stensagervej`, including the ones at `Janesvej`.
+
 ### Mapping decisions worth knowing
 
 | Source | Target | How |
@@ -231,37 +254,36 @@ always did.
 A split is logged, naming what came out of it, since the source string no
 longer appears anywhere in the result.
 
-### Klub rows are flagged in the comment, not converted
+### Klub rows
 
-Befordring to and from a klub does not exist in the old system but does here.
-To record it anyway, caseworkers put the klub in `ElevensAdresse` and the
-student's home in `SkoleNavnBefordring` — or the reverse, for the return trip.
-The row therefore describes a journey its own columns misname, and nothing
-automatic can recover which was which.
+The old system had no klub kørsel. To record it anyway, caseworkers wrote the klub into whichever field was to hand — `ElevensAdresse`, with the home in `SkoleNavnBefordring`, or the reverse for the return trip, or simply a line in `Kommentar`. The row therefore describes a journey its own columns misname, and nothing automatic can recover which was which.
 
-So the raw values are carried across verbatim, appended to that kørselsrække's
-comment:
+**Detection** is across all three fields (`_KLUB_FELTER`), matched through `_fold` so case, spacing and `æ/ø/å` versus `ae/oe/aa` all hit. Markers are `klub` — which catches *Klubben*, *klubben*, *ungdomsklub* — and the phrase `Holme Søndergård`.
+
+Bare `holme` is **deliberately not** a marker. Holmevej, Holme Ringvej and Holmesvinget are ordinary Aarhus streets, and matching them would drag every student living in Holme onto this path. Over-matching on `klub` costs only a comment; over-matching on `holme` would move real addresses.
+
+**The bevilling goes on the student's address, never the klub's:**
+
+1. A row whose `ElevensAdresse` is the klub supplies **no** address candidate. Its siblings — the return trip, where the home sits in `ElevensAdresse` — still do.
+2. If that leaves nothing, the student's current address from LOIS is used.
+3. Failing both, the bevilling is rejected as usual.
+
+Note that `_klub_i_adressen` and `_klub_relevant` are different tests on purpose. A klub named in `SkoleNavnBefordring` or `Kommentar` does not disqualify that row's address — only a klub sitting in the address field does.
+
+**Every kørselsrække in the bevilling** then carries a comment, not just the rows that mention the klub, because it is the bevilling as a whole that needs rebuilding. Each carries its **own** row's raw values, so a caseworker can see which journey said what:
 
 ```
-Fra foranstaltningsdata konvertering:
-ElevensAdresse: Klubben Holme Søndergård, 8270 Højbjerg
-SkoleNavnBefordring: Kærlundvej 16, 8260 Viby J
+KONVERTERING-PPR | klub kan indgå i befordringen
+Kilde (denne kørselsrække):
+  ElevensAdresse: Klubben Holme Søndergård: Nygårdsvej 5, 8270 Højbjerg
+  SkoleNavnBefordring: Møllevangskolen
+  Kommentar: (tom)
+Bevillingen er oprettet på elevens egen adresse: Kærlundvej 16, Ormslev, 8260 Viby J
+Det gamle system havde ikke klubkørsel, så klubben er skrevet ind i felterne
+ovenfor. Ret bevillingen manuelt, så den afspejler den faktiske befordring.
 ```
 
-An existing comment is kept and the note added below it. Detection is per
-**row**, not per bevilling — the marker sits on the individual row, and it is
-that row's journey the note describes.
-
-`_KLUB_MARKERS` holds the places to look for, currently just
-`"Klubben Holme Søndergård"`. Matching goes through `_fold()`, which casefolds,
-strips spaces and flattens æ/ø/å, so `"Søndergaard"` and `"Søndergård"` both
-match without listing every spelling. Add a marker to the tuple as more turn
-up.
-
-The queue phase reports how many rows were flagged, so the size of the manual
-follow-up is known before anything is converted. Note the bevilling itself
-still converts with whatever address those columns produced — the note is what
-tells a caseworker to rebuild the klub kørsel properly.
+The note is written after the address is settled, because it names the address the bevilling ended up on.
 
 ### Caseworker assignment
 
@@ -336,9 +358,10 @@ An address is resolved by the first of these that answers. Each step is weaker t
 |---|---|---|
 | 1 | exactly one register row matches | the source itself |
 | 2 | several matched, CPR names one of them | CPR |
-| 3 | none matched, CPR names a row at the same street and house number | CPR |
-| 4 | several matched and all sit at the same coordinate | position only |
-| 5 | the case is closed and LOIS knows the student | the student's current address |
+| 3 | none matched, but the source **is** the student's registered address once separators are dropped | CPR, no search involved |
+| 4 | none matched, CPR names a row at the same street and house number | CPR |
+| 5 | several matched and all sit at the same coordinate | position only |
+| 6 | the case is closed and LOIS knows the student | the student's current address |
 | — | otherwise | rejected for manual follow-up |
 
 **Every address whose match required an inference carries a comment on its kørselsrækker**, saying what was read into the source and asking a caseworker to check. Steps 2–5 always do. Step 1 does only when `_er_i_praksis_samme` says the two texts are not simply the same address written differently.
@@ -347,10 +370,10 @@ Two things are **not** inference, and get no comment:
 
 | | source | register |
 |---|---|---|
-| punctuation and spacing | `Åbyhøjgård 13,st th, 8230 Åbyhøj` | `Åbyhøjgård 13, st. th, 8230 Åbyhøj` |
+| punctuation, spacing and commas | `Haurumsvej 13.1.th, 8381 Tilst` | `Haurumsvej 13, 1. th, 8381 Tilst` |
 | parts only the register has | `Østervang 25, 8380 Trige` | `Østervang 25, Spørring, 8380 Trige` |
 
-Neither says anything was worked out. The commas and periods just sit elsewhere, and the register knows a place name the source never had.
+Neither says anything was worked out. Commas count as punctuation here: once whitespace, commas and periods are all removed, `Haurumsvej 13.1.th` and `Haurumsvej 13, 1. th` are one string, so splitting the floor off the street told us nothing that could have been wrong.
 
 Everything else is. A stripped leading zero (`Borresøvej 041` → `41`), a merged floor and door (`143,1,-2` → `143, 1. 2`), an expanded abbreviation (`I. Christensens Gade`), a street split off from a floor (`Sjællandsgade 95A 1. sal`) — each is a *reading* of the source that could be wrong.
 
@@ -604,6 +627,40 @@ Two guards on the rule:
 
 - **Runs of at most three digits.** A four-digit run is postcode-shaped, and Denmark does have postcodes beginning with zero — `0800`, and the `0900`–`0999` København C range. `_canon` is not applied to the postcode component either, so that is two independent guards.
 - **Stripped before the spaces are collapsed.** Once `"vestergade 041"` has become `"vestergade041"` the zero is no longer recognisable as leading, and the rule would either do nothing or hit the wrong digits.
+
+### The source *is* the student's address, written differently
+
+```
+source   Haurumsvej 13.1.th, 8381 Tilst
+CPR      Haurumsvej 13, 1. th, 8381 Tilst
+
+both     haurumsvej131th8381tilst
+```
+
+`_vaelg_via_flad_cpr` reduces both to letters and digits — every separator dropped — and takes the student's address when they are the same string.
+
+This is **the only step that does not depend on the search**. Every other one works on rows the register returned, and when the street component is mangled badly enough the search returns nothing, leaving no pool to choose from. Here there is nothing to search for: the source and a known address are simply the same text.
+
+That makes it strong evidence, so it runs before the pool-based CPR step and well before the coordinate guess. It still requires a true miss, and the CPRs behind the address to agree.
+
+It is **not** "use CPR whenever nothing matched". `Holme Byvej 42.` with CPR saying `Kalkærparken 135` stays unresolved — those two flatten to different strings, and the student has simply moved.
+
+Whether it leaves a comment follows the ordinary rule: none where the two differ only in punctuation, which is the usual case here.
+
+### A floor glued on with periods
+
+```
+Haurumsvej 13.1.th, 8381 Tilst      register: Haurumsvej 13, 1. th, 8381 Tilst
+Holme Byvej 42., 8270 Højbjerg      register: Holme Byvej 42, 8270 Højbjerg
+```
+
+A period can stand where a comma or a space belongs, so `_STREET_THEN_FLOOR` accepts `.` as a separator, `_FLOOR_PREFIX` no longer requires whitespace after the floor's own period (`1.th`), and `_street_variants` adds a spelling with trailing punctuation stripped.
+
+`_FLOOR_PREFIX` now requires **either** a period or whitespace after the floor token, so a bare door number like `12` is not read as floor 1 door 2.
+
+`_HOUSE_NUMBER_TAIL` tolerates a trailing period too. Without that the probe could not strip `42.` down to the street, so a failure reported `intet på den vej i det postnummer` for a street that plainly exists — a misleading message, not just a missing hint.
+
+Both resolve exactly, and neither gets a comment: removing whitespace, commas and periods makes source and register identical, so nothing was inferred.
 
 ### Floor and door split across components
 

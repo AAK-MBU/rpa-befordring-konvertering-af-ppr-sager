@@ -5,6 +5,7 @@ befordring application via its REST API.
 
 import logging
 import os
+import re
 
 from datetime import date
 
@@ -40,6 +41,65 @@ def _fetch_lookup(api_endpoint: str, api_key: str, path: str) -> list[dict]:
             f"Lookup request failed [{path}]: {response.status_code} — {response.text}"
         )
     return response.json()
+
+
+_MATRIKEL_STED = re.compile(r"\(([^)]+)\)")
+
+
+def _vaelg_matrikel(
+    kandidater: list[dict],
+    skolens_adresse: str | None,
+    skole_navn: str | None,
+) -> int | None:
+    """Which matrikel a bevilling belongs to, when a skolekode has several.
+
+    Some schools run on two sites under one skolekode:
+
+        Stensagerskolen (Janesvej)        751903
+        Stensagerskolen (Stensagervej)    751903
+
+    The lookup label carries the site in parentheses, and BefordringsData
+    carries SkolensAdresse — "Janesvej 2", "Stensagervej 11" — so the street
+    in the address is what tells them apart. Matched on the normalised forms,
+    so spacing and case do not matter and "Bøgeskov Høvej" finds "Bøgeskov
+    Høvej 10".
+
+    SkoleNavnBefordring is tried as well, because the source sometimes names
+    the site there instead: "Stensagerskolen (afd. Stensagervej)".
+
+    Returns None when the code is unknown, exactly as before. Raises when the
+    code is known but the site cannot be told apart — a wrong school is worse
+    than a stopped case, and picking one of two at random is what this
+    replaces.
+    """
+
+    if not kandidater:
+        return None
+
+    if len(kandidater) == 1:
+        return kandidater[0]["id"]
+
+    haystack = _normalise(skolens_adresse) + "\x00" + _normalise(skole_navn)
+
+    traeffere = [
+        k for k in kandidater
+        if (sted := _MATRIKEL_STED.search(str(k.get("label") or "")))
+        and _normalise(sted.group(1)) in haystack
+    ]
+
+    if len(traeffere) == 1:
+        return traeffere[0]["id"]
+
+    raise BusinessError(
+        f"Skolekode {kandidater[0].get('skolekode')} har "
+        f"{len(kandidater)} matrikler "
+        f"({', '.join(str(k.get('label')) for k in kandidater)}), og "
+        f"SkolensAdresse {skolens_adresse!r} / SkoleNavnBefordring "
+        f"{skole_navn!r} peger på "
+        f"{'ingen af dem' if not traeffere else 'flere af dem'}. "
+        "Kan ikke afgøre hvilken afdeling bevillingen hører til — "
+        "kræver manuel opfølgning."
+    )
 
 
 def _normalise(value: str | None) -> str:
@@ -391,14 +451,22 @@ def create_bevilling(
             "kørselsrækker. Check the Ugedag lookup table."
         )
 
-    # Skolematrikel map: skolekode (string) → matrikel_id
-    # /lookup/skolematrikel returns {"id": matrikel_id, "label": naam, "skolekode": ...}
-    # SkoleID from BefordringsData matches the skolekode column in the lookup
-    skolematrikel_map: dict[str, int] = {
-        str(item["skolekode"]).strip(): item["id"]
-        for item in skolematrikler
-        if item.get("skolekode") is not None
-    }
+    # Skolematrikel map: skolekode (string) → EVERY matrikel with that code.
+    # /lookup/skolematrikel returns {"id": matrikel_id, "label": navn, "skolekode": ...},
+    # and SkoleID from BefordringsData matches the skolekode column.
+    #
+    # A list, not one id. Several schools are split across two sites that
+    # share a skolekode — Stensagerskolen is 751903 at both Janesvej and
+    # Stensagervej — and keying on the code alone silently kept whichever
+    # came last, sending every student to the same site. _vaelg_matrikel
+    # picks between them on SkolensAdresse.
+    skolematrikel_map: dict[str, list[dict]] = {}
+
+    for item in skolematrikler:
+        if item.get("skolekode") is None:
+            continue
+
+        skolematrikel_map.setdefault(str(item["skolekode"]).strip(), []).append(item)
 
     # --- Ensure student exists in the befordring app ---
     stamdata_response = requests.get(
@@ -581,7 +649,23 @@ def create_bevilling(
 
         # --- Resolve bevilling-level lookup IDs ---
         skole_id = str(bevilling.get("SkoleID") or "").strip()
-        matrikel_id = skolematrikel_map.get(skole_id)
+        matrikel_kandidater = skolematrikel_map.get(skole_id, [])
+        matrikel_id = _vaelg_matrikel(
+            matrikel_kandidater,
+            bevilling.get("SkolensAdresse"),
+            bevilling.get("SkoleNavnBefordring"),
+        )
+
+        if len(matrikel_kandidater) > 1:
+            logger.info(
+                "  Skolekode %s har %d matrikler — valgt %s ud fra "
+                "SkolensAdresse %r.\n",
+                skole_id,
+                len(matrikel_kandidater),
+                next((k.get("label") for k in matrikel_kandidater
+                      if k["id"] == matrikel_id), "?"),
+                bevilling.get("SkolensAdresse"),
+            )
 
         raw_hjemmel = (bevilling.get("HjemmelForBevilling") or "").strip()
         hjemmel_entry = _HJEMMEL_MAPPING.get(raw_hjemmel)
