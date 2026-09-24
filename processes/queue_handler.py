@@ -1290,6 +1290,7 @@ def _unresolved_line(
     lois: list[tuple[str, str]] | None = None,
     kandidater: list[dict] | None = None,
     raekker: dict[str, dict] | None = None,
+    klub: bool = False,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -1316,6 +1317,18 @@ def _unresolved_line(
         f"  {kilde}",
         f"      normaliseret : {normaliseret}",
     ]
+
+    # Say so up front: a klub address not resolving is the design, not a
+    # problem, and the bevilling is converted on the student's own address.
+    if klub:
+        linjer.append(
+            "      FORVENTET    : klubadresse — en klub er ikke en bolig og "
+            "findes ikke i registret som en."
+        )
+        linjer.append(
+            "                     Bevillingen oprettes på elevens egen "
+            "adresse; kørselsrækkerne får en kommentar."
+        )
 
     for prefix, antal, matchede in forsoeg:
         linjer.append(
@@ -1550,6 +1563,12 @@ def _resolve_adresse_ids(
     # key -> the CPRs whose rows used this address. Only needed for failures,
     # where it is what lets the log say where CPR has that student living.
     cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
+    # Keys whose ElevensAdresse names a klub. These are EXPECTED not to
+    # resolve — a klub is not a home and is not in the register as one — and
+    # the bucket loop puts those bevillinger on the student's own address
+    # instead. Tracked only so the failure log can say so rather than listing
+    # them as problems.
+    klub_keys: set[tuple[str, ...]] = set()
     overskrevne = 0
     rettede = 0
 
@@ -1572,6 +1591,9 @@ def _resolve_adresse_ids(
 
         if cpr:
             cpr_pr_adresse.setdefault(key, set()).add(cpr)
+
+        if _klub_i_adressen(row):
+            klub_keys.add(key)
 
     keys = set(kilder)
 
@@ -1736,6 +1758,7 @@ def _resolve_adresse_ids(
             "forsoeg": forsoeg,
             "naboer": naboer,
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
+            "klub": key in klub_keys,
             # The raw rows, kept so an ambiguity can still be settled below —
             # by CPR, or failing that by their coordinates, which the search
             # returns alongside the text.
@@ -1945,10 +1968,16 @@ def _resolve_adresse_ids(
     )
 
     if unresolved:
+        klub_antal = sum(1 for e in unresolved if e.get("klub"))
+
         logger.warning(
-            "%d address(es) unresolved — the bevillinger using them will be "
-            "rejected for manual follow-up:\n%s\n",
+            "%d address(es) unresolved. %d of them are klub addresses, which "
+            "are EXPECTED not to resolve — those bevillinger are created on "
+            "the student's own address. The remaining %d will have their "
+            "bevillinger rejected for manual follow-up:\n%s\n",
             len(unresolved),
+            klub_antal,
+            len(unresolved) - klub_antal,
             "\n".join(_unresolved_line(**entry) for entry in unresolved),
         )
 
