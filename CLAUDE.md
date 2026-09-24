@@ -341,11 +341,22 @@ An address is resolved by the first of these that answers. Each step is weaker t
 | 5 | the case is closed and LOIS knows the student | the student's current address |
 | — | otherwise | rejected for manual follow-up |
 
-**Every address that was not found word for word carries a comment on its kørselsrækker**, saying what was inferred and asking a caseworker to check. The only silent case is step 1 where the source text and the register text are identical but for case and spacing — nothing was inferred, so there is nothing to check.
+**Every address whose match required an inference carries a comment on its kørselsrækker**, saying what was read into the source and asking a caseworker to check. Steps 2–5 always do. Step 1 does only when `_er_i_praksis_samme` says the two texts are not simply the same address written differently.
 
-That deliberately includes step 1 matches that relied on normalisation. `Blomsterlunden 143,1,-2` resolves to exactly one row, but it took punctuation rules to get there, so it is flagged. So is `Kærlundvej 16` matching `Kærlundvej 16, Ormslev`, where the register simply knows more than the source did.
+Two things are **not** inference, and get no comment:
 
-The comment names the method, so the cheap checks are distinguishable from the real ones: a normalised match reads differently from a coordinate guess, which reads differently again from a closed case placed on the student's current address.
+| | source | register |
+|---|---|---|
+| punctuation and spacing | `Åbyhøjgård 13,st th, 8230 Åbyhøj` | `Åbyhøjgård 13, st. th, 8230 Åbyhøj` |
+| parts only the register has | `Østervang 25, 8380 Trige` | `Østervang 25, Spørring, 8380 Trige` |
+
+Neither says anything was worked out. The commas and periods just sit elsewhere, and the register knows a place name the source never had.
+
+Everything else is. A stripped leading zero (`Borresøvej 041` → `41`), a merged floor and door (`143,1,-2` → `143, 1. 2`), an expanded abbreviation (`I. Christensens Gade`), a street split off from a floor (`Sjællandsgade 95A 1. sal`) — each is a *reading* of the source that could be wrong.
+
+The test runs against the **raw** source, before phrase corrections and address overrides, so those always show up as inference.
+
+The comment names the method, so the cheap checks stay distinguishable from the real ones: a normalised match reads differently from a coordinate guess, which reads differently again from a closed case placed on the student's current address.
 
 ### How addresses are matched
 

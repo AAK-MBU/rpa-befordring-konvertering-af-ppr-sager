@@ -957,18 +957,58 @@ def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
     return valgt["adresse_id"], valgt.get("adresse_tekst") or ""
 
 
-def _er_samme_tekst(a: str | None, b: str | None) -> bool:
-    """Whether two address strings are the same but for case and spacing.
+def _naive_led(tekst: str | None) -> list[str]:
+    """Comma parts with every space and period taken out, casefolded.
 
-    The test for "was anything actually inferred". Deliberately strict:
-    everything the matcher does beyond case and whitespace — punctuation,
-    floor and door, abbreviations, zero padding, a place name the register
-    adds — counts as work that a caseworker should be able to see and check.
+    Deliberately naive: it splits on commas and flattens, and makes no attempt
+    to work out which part is the street, the floor or the postcode. That is
+    the point — it is the comparison a person would make by eye.
     """
 
-    return " ".join(str(a or "").split()).casefold() == " ".join(
-        str(b or "").split()
-    ).casefold()
+    return [
+        "".join(stykke.split()).replace(".", "").casefold()
+        for stykke in str(tekst or "").split(",")
+        if stykke.strip()
+    ]
+
+
+def _er_i_praksis_samme(kilde: str | None, register: str | None) -> bool:
+    """Whether the two are the same address written slightly differently.
+
+    The test for "did the matcher actually have to infer anything", and so
+    for whether a kørselsrække needs a comment at all. Two things do NOT
+    count as inference:
+
+      punctuation and spacing      "Åbyhøjgård 13,st th, 8230 Åbyhøj" against
+                                   "Åbyhøjgård 13, st. th, 8230 Åbyhøj" is
+                                   one address written twice. Nothing was
+                                   worked out; the commas and periods just
+                                   sit elsewhere.
+
+      parts only the register has  "Østervang 25, 8380 Trige" against
+                                   "Østervang 25, Spørring, 8380 Trige". The
+                                   register knows the place name and the
+                                   source never did. Nothing was assumed
+                                   about the source.
+
+    Everything else is. A stripped leading zero, a merged floor and door, an
+    expanded abbreviation, a street split off from a floor — each is a reading
+    of the source that could be wrong, and each gets a comment.
+
+    Compared against the RAW source, before any correction, so a phrase
+    replacement or a whole-address override always shows up as inference.
+    """
+
+    kilde_led = _naive_led(kilde)
+
+    if not kilde_led:
+        return False
+
+    # Subsequence, so extra parts in the register are free and missing ones
+    # are not — the same rule _matches uses, on a blunter comparison.
+    resten = iter(_naive_led(register))
+
+    return all(led in resten for led in kilde_led)
 
 
 def _generel_adresse_note(kilde: str, valgt: str) -> str:
@@ -1432,7 +1472,7 @@ def _resolve_adresse_ids(
             # caseworker can check every address that was not simply found.
             note = (
                 ""
-                if _er_samme_tekst(kilder[key], adresse_tekst)
+                if _er_i_praksis_samme(kilder[key], adresse_tekst)
                 else _generel_adresse_note(kilder[key], adresse_tekst)
             )
 
