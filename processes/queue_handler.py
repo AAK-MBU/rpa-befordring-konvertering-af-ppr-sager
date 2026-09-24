@@ -1180,6 +1180,93 @@ def _lukket_sag_note(kilde: str, adresse_tekst: str) -> str:
     )
 
 
+def _vaelg_via_koordinater_uden_match(entry: dict) -> tuple[str, str] | None:
+    """Last resort: one address from a building that is all one point.
+
+        source     Sifsgade 39, 2. 8230 Åbyhøj      floor 2, no door
+        register   Sifsgade 39, 2. 1 … 2. 6         six flats on that floor
+                   plus 27 more, every one at 56.1502667 / 10.1693075
+
+    Nothing matches — a source middle with no counterpart is fatal, and
+    rightly so — but the register's coordinate is one point for the whole
+    building, and the coordinate is what the application uses for walking
+    distance and routing. Refusing the lot converts nothing; taking one gives
+    the right position and a flat that needs correcting, which the comment
+    says.
+
+    Narrowed to the floor the source DID name before choosing. The source
+    said "2", so the six rows whose own middles begin with 2 are preferred
+    over the twenty-seven that do not. A guess on the right floor beats a
+    guess on any floor, and it costs one comparison.
+
+    Guards: a true miss only, street and postcode equal, and every row in the
+    set being chosen from at the SAME non-null point. Different points are
+    different places and must never be guessed between.
+    """
+
+    if entry.get("count"):
+        return None
+
+    raekker = list((entry.get("raekker") or {}).values())
+
+    if not raekker:
+        return None
+
+    kilde = list(entry["key"])
+
+    paa_vejen = [
+        r for r in raekker
+        if (k := _components(r.get("adresse_tekst"))) and len(k) >= 2
+        and _canon(k[0]) == _canon(kilde[0])
+        and _postcode_of(k) == _postcode_of(kilde)
+    ]
+
+    if not paa_vejen:
+        return None
+
+    # Prefer rows on the floor the source named: every source middle must be
+    # the start of one of the candidate's, in order. "2" starts "2. 1".
+    def paa_etagen(raekke: dict) -> bool:
+        midt = [_canon(m) for m in _components(raekke.get("adresse_tekst"))[1:-1]]
+        resten = iter(midt)
+
+        return all(
+            any(m.startswith(_canon(kilde_midt)) for m in resten)
+            for kilde_midt in kilde[1:-1]
+        )
+
+    kandidater = [r for r in paa_vejen if paa_etagen(r)] or paa_vejen
+
+    punkter = {(r.get("latitude"), r.get("longitude")) for r in kandidater}
+
+    if len(punkter) != 1:
+        return None
+
+    lat, lon = punkter.pop()
+
+    if lat is None or lon is None:
+        return None
+
+    valgt = min(kandidater, key=lambda r: r.get("adresse_tekst") or "")
+
+    return valgt["adresse_id"], valgt.get("adresse_tekst") or ""
+
+
+def _antaget_note(kilde: str, antal: int, valgt: str) -> str:
+    """The comment for an address assumed from street and postcode alone."""
+
+    return _konverterings_note(
+        "adresse antaget ud fra vej og postnummer",
+        f"Kilde: {kilde}",
+        f"Kildens etage/dør passer ikke på nogen af de {antal} boliger, "
+        "registret har på vejen og husnummeret — men de ligger alle samme "
+        "sted.",
+        f"Valgt: {valgt}",
+        "Placeringen er derfor rigtig, men boligen er et gæt og skal rettes "
+        "manuelt.",
+    )
+
+
 def _upraecis_note(kilde: str, antal: int, valgt: str) -> str:
     """The comment left on a kørselsrække whose address was assumed."""
 
@@ -1761,6 +1848,17 @@ def _resolve_adresse_ids(
                     metode = "koordinat"
 
             if valgt is None:
+                # Last resort: nothing matched at all, but the whole building
+                # is one point in the register. Right position, guessed flat.
+                valgt = _vaelg_via_koordinater_uden_match(entry)
+
+                if valgt is not None:
+                    note = _antaget_note(
+                        entry["kilde"], len(entry.get("raekker") or {}), valgt[1]
+                    )
+                    metode = "koordinat-antaget"
+
+            if valgt is None:
                 stadig_uloeste.append(entry)
                 continue
 
@@ -1796,6 +1894,15 @@ def _resolve_adresse_ids(
                     "  %s: ingen søgning ramte, men kilden er tegn for tegn "
                     "elevens registrerede adresse %r — valgt.\n",
                     entry["kilde"],
+                    adresse_tekst,
+                )
+            elif metode == "koordinat-antaget":
+                logger.warning(
+                    "  %s: intet match, men alle %d boliger på vejnummeret "
+                    "ligger samme sted — valgt %r. Placeringen er rigtig, "
+                    "boligen skal rettes manuelt.\n",
+                    entry["kilde"],
+                    len(entry.get("raekker") or {}),
                     adresse_tekst,
                 )
             elif metode == "eneste-raekke":

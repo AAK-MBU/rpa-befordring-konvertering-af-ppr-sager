@@ -362,7 +362,8 @@ An address is resolved by the first of these that answers. Each step is weaker t
 | 4 | none matched, CPR names a row at the same street and house number | CPR |
 | 5 | none matched, and the register holds exactly **one** address at that street and house number | uniqueness |
 | 6 | several matched and all sit at the same coordinate | position only |
-| 7 | the case is closed and LOIS knows the student | the student's current address |
+| 7 | nothing matched, but every address at that street and number is one point | position only |
+| 8 | the case is closed and LOIS knows the student | the student's current address |
 | — | otherwise | rejected for manual follow-up |
 
 **Every address whose match required an inference carries a comment on its kørselsrækker**, saying what was read into the source and asking a caseworker to check. Steps 2–5 always do. Step 1 does only when `_er_i_praksis_samme` says the two texts are not simply the same address written differently.
@@ -511,6 +512,31 @@ Uniqueness is the entire safety. A block of flats returns several rows, none mat
 Street and postcode must still be equal. The rows come from prefixes built on the source's own street, so that is nearly given, but a street variant could have reached a neighbour and the check makes it explicit.
 
 Always commented — the source said something the register does not confirm.
+
+### Nothing matched, but the building is one point
+
+```
+source     Sifsgade 39, 2. 8230 Åbyhøj      floor 2, no door
+register   Sifsgade 39, 2. 1 … 2. 6         six flats on that floor
+           plus 27 more, every one at 56.1502667 / 10.1693075
+```
+
+A source middle with no counterpart is fatal, and rightly so. But the register gives the whole building **one coordinate**, and the coordinate is what the application uses for walking distance and routing. Refusing converts nothing; taking one gives the right position and a flat that needs correcting.
+
+**Narrowed to the floor the source did name** before choosing: every source middle must begin one of the candidate's. The source said `2`, so the six rows whose middles start with `2` are preferred over the twenty-seven that do not — `Sifsgade 39, 2. 1` rather than `1. 1`. A guess on the right floor beats a guess on any floor.
+
+Guards: a true miss only, street and postcode equal, and every row in the set being chosen from at the **same non-null point**. `Spredtvej 4` whose two flats sit at different coordinates is still refused — different points are different places.
+
+This is the weakest step in the chain and runs last. Always commented, and the comment says the dwelling is a guess:
+
+```
+KONVERTERING-PPR | adresse antaget ud fra vej og postnummer
+Kilde: Sifsgade 39, 2. 8230 Åbyhøj
+Kildens etage/dør passer ikke på nogen af de 33 boliger, registret har på
+vejen og husnummeret — men de ligger alle samme sted.
+Valgt: Sifsgade 39, 2. 1, 8230 Åbyhøj
+Placeringen er derfor rigtig, men boligen er et gæt og skal rettes manuelt.
+```
 
 ### A missing floor, resolved by coordinates
 
