@@ -758,20 +758,21 @@ def create_bevilling(
             # lookups above: a bad value must fail the case before anything is
             # written.
             #
-            # queue_handler already swaps inverted dates on a CLOSED case, so
-            # anything still inverted here belongs to a case someone can
-            # actually correct.
+            # A safety net rather than the normal path: queue_handler swaps
+            # reversed dates on every case, open or closed, so an item built
+            # by the current code never arrives here inverted. One queued by
+            # an older version still could, and failing before the write is
+            # far better than a 400 halfway through.
             fra = _parse_date(kr.get("BevillingFra"))
             til = _parse_date(kr.get("BevillingTil"))
 
             if fra and til and fra > til:
                 raise BusinessError(
                     f"Kørselsrække on PPR case {ppr_case_id} has "
-                    f"BevillingFra {fra} after BevillingTil {til}. The source "
-                    "dates are reversed or wrong — correct them in "
-                    "BefordringsData, or add the case to "
-                    "Lukkede foranstaltningsmapper.csv if it is closed and "
-                    "cannot be corrected."
+                    f"BevillingFra {fra} after BevillingTil {til}, which the "
+                    "API rejects. queue_handler swaps these, so this item was "
+                    "most likely queued before that existed — re-run --queue "
+                    "to rebuild it."
                 )
 
             koersel_payload = {

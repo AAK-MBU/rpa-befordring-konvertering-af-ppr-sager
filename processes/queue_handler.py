@@ -1167,15 +1167,30 @@ def _cpr_valg_note(kilde: str, antal: int, valgt: str) -> str:
     )
 
 
-def _byttede_datoer_note(fra: str, til: str) -> str:
-    """The comment for a closed case whose kørsel dates were reversed."""
+def _byttede_datoer_note(fra: str, til: str, lukket: bool) -> str:
+    """The comment for a kørselsrække whose dates were the wrong way round.
+
+    The same repair either way — the row cannot be created otherwise — but
+    the follow-up differs, so the wording does too. A closed case cannot be
+    corrected at source and the swap is the end of it; an open one can, and
+    someone should look.
+    """
+
+    if lukket:
+        return _konverterings_note(
+            "lukket sag — byttede datoer",
+            f"Kilden havde BevillingFra {fra} EFTER BevillingTil {til}.",
+            f"Datoerne er byttet om, så perioden blev {til} til {fra}.",
+            "PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers "
+            "ikke kunne oprettes. Kontrollér perioden, hvis den får betydning.",
+        )
 
     return _konverterings_note(
-        "lukket sag — byttede datoer",
+        "byttede datoer",
         f"Kilden havde BevillingFra {fra} EFTER BevillingTil {til}.",
         f"Datoerne er byttet om, så perioden blev {til} til {fra}.",
-        "PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers ikke "
-        "kunne oprettes. Kontrollér perioden, hvis den får betydning.",
+        "Rækken kunne ellers ikke oprettes. Sagen er ÅBEN — ret datoerne i "
+        "foranstaltningsdata, hvis perioden ikke er rigtig.",
     )
 
 
@@ -2312,6 +2327,7 @@ def retrieve_items_for_queue() -> list[dict]:
     klub_rows = 0
     klub_bevillinger = 0
     byttede_datoer = 0
+    byttede_datoer_aabne = 0
     omvendte_datoer: set[str] = set()
     noterede_rows = 0
     lukkede_konverteret = 0
@@ -2402,24 +2418,26 @@ def retrieve_items_for_queue() -> list[dict]:
                 # gyldig_til outright, so the row cannot be created as it
                 # stands.
                 #
-                # On a CLOSED case that is a dead end: nobody can correct the
-                # source, and refusing loses the row for good. The two dates
-                # are almost certainly transposed — swapping them yields a
-                # plausible period and keeps both original values — so they
-                # are swapped and the kørselsrække says exactly what happened.
+                # Swapped either way. The two dates are almost certainly
+                # transposed, swapping yields a plausible period and keeps
+                # both original values, and refusing would lose the row — on
+                # an open case just as much as a closed one.
                 #
-                # An OPEN case is left alone. bevilling_creation then fails it
-                # before anything is written, and someone fixes the source.
+                # The comment differs: a closed case cannot be corrected at
+                # source, an open one can, and the wording says which.
                 fra, til = koersel.get("BevillingFra"), koersel.get("BevillingTil")
 
                 if fra and til and fra > til:
+                    koersel["BevillingFra"], koersel["BevillingTil"] = til, fra
+                    koersel["Kommentar"] = _extend_kommentar(
+                        koersel.get("Kommentar"),
+                        _byttede_datoer_note(fra, til, sag_lukket),
+                    )
+
                     if sag_lukket:
-                        koersel["BevillingFra"], koersel["BevillingTil"] = til, fra
-                        koersel["Kommentar"] = _extend_kommentar(
-                            koersel.get("Kommentar"), _byttede_datoer_note(fra, til)
-                        )
                         byttede_datoer += 1
                     else:
+                        byttede_datoer_aabne += 1
                         omvendte_datoer.add(str(ppr_case_id))
 
                 # Where this row's address was only resolved by assuming a
@@ -2632,12 +2650,13 @@ def retrieve_items_for_queue() -> list[dict]:
             byttede_datoer,
         )
 
-    if omvendte_datoer:
+    if byttede_datoer_aabne:
         logger.warning(
-            "%d OPEN case(s) have a kørselsrække with BevillingFra after "
-            "BevillingTil. These are rejected rather than guessed at: correct "
-            "the dates in BefordringsData, or add the case to "
-            "Lukkede foranstaltningsmapper.csv if it is in fact closed:\n%s\n",
+            "%d kørselsrække(r) on %d OPEN case(s) had BevillingFra after "
+            "BevillingTil and were swapped so the row could be created. "
+            "These CAN be corrected at source — check the periods and fix "
+            "BefordringsData if the swap guessed wrong:\n%s\n",
+            byttede_datoer_aabne,
             len(omvendte_datoer),
             "\n".join(f"  {c}" for c in sorted(omvendte_datoer)),
         )

@@ -456,21 +456,25 @@ The API rejects `gyldig_fra` after `gyldig_til` outright, so such a row cannot b
 
 **Checked before the bevilling is written**, alongside the lookups. It used to surface as a 400 during the POST loop, which left a bevilling created with no kørselsrækker — and the retry then adopted that bevilling and failed on it again, every time. Exactly the failure the pre-create pass exists to prevent; date ranges had simply been left out of it.
 
-What happens then depends on whether the case is closed:
+**The dates are swapped, on every case.** Transposition is the overwhelmingly likely explanation, swapping yields a plausible period and keeps both original values, and refusing would lose the row — on an open case just as much as a closed one.
 
-- **Closed** — the dates are swapped and the row is created. Nobody can correct the source, and refusing loses the row for good. Transposed dates are the overwhelmingly likely explanation, swapping yields a plausible period and keeps both original values, and the kørselsrække records it:
+Only the comment differs, because the follow-up does:
 
-  ```
-  KONVERTERING-PPR | lukket sag — byttede datoer
-  Kilden havde BevillingFra 2020-06-30 EFTER BevillingTil 2019-08-01.
-  Datoerne er byttet om, så perioden blev 2019-08-01 til 2020-06-30.
-  PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers ikke kunne
-  oprettes. Kontrollér perioden, hvis den får betydning.
-  ```
+```
+KONVERTERING-PPR | lukket sag — byttede datoer          <- closed
+...
+PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers ikke kunne
+oprettes. Kontrollér perioden, hvis den får betydning.
 
-- **Open** — left alone and the case is rejected, with the case ids listed in the run log. Someone can fix the source, and guessing on a live bevilling is not worth it.
+KONVERTERING-PPR | byttede datoer                        <- open
+...
+Rækken kunne ellers ikke oprettes. Sagen er ÅBEN — ret datoerne i
+foranstaltningsdata, hvis perioden ikke er rigtig.
+```
 
-Note the closed-case list is used in **two** places now: here in `queue_handler`, and for the address fallback. `bevilling_creation` still knows nothing about it — all the data repair happens at queue time, and creation only validates and posts.
+The run log counts the two separately and lists the open case ids, since those are the ones someone can still fix at source.
+
+The check in `bevilling_creation` stays as a **safety net**: an item queued before the swap existed could still arrive inverted, and failing before the write beats a 400 halfway through. `bevilling_creation` itself still knows nothing about the closed-case list — all data repair happens at queue time, and creation only validates and posts.
 
 ### Closed PPR cases
 
