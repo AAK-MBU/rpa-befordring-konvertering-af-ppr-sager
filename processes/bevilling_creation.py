@@ -750,6 +750,30 @@ def create_bevilling(
             rutetype_navn = _RUTETYPE_FROM_TIDSPUNKT.get(raw_tidspunkt)
             rutetype_id = rutetype_map.get(_normalise(rutetype_navn)) if rutetype_navn else None
 
+            # The date range, checked HERE rather than by the API after the
+            # bevilling exists. The backend rejects gyldig_fra > gyldig_til
+            # with a 400, and discovering that during the POST loop leaves a
+            # bevilling created with no kørselsrækker — which the retry then
+            # adopts and fails on again, every time. Same reasoning as the
+            # lookups above: a bad value must fail the case before anything is
+            # written.
+            #
+            # queue_handler already swaps inverted dates on a CLOSED case, so
+            # anything still inverted here belongs to a case someone can
+            # actually correct.
+            fra = _parse_date(kr.get("BevillingFra"))
+            til = _parse_date(kr.get("BevillingTil"))
+
+            if fra and til and fra > til:
+                raise BusinessError(
+                    f"Kørselsrække on PPR case {ppr_case_id} has "
+                    f"BevillingFra {fra} after BevillingTil {til}. The source "
+                    "dates are reversed or wrong — correct them in "
+                    "BefordringsData, or add the case to "
+                    "Lukkede foranstaltningsmapper.csv if it is closed and "
+                    "cannot be corrected."
+                )
+
             koersel_payload = {
                 "gyldig_fra": kr.get("BevillingFra"),
                 "gyldig_til": kr.get("BevillingTil"),

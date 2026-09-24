@@ -1167,6 +1167,18 @@ def _cpr_valg_note(kilde: str, antal: int, valgt: str) -> str:
     )
 
 
+def _byttede_datoer_note(fra: str, til: str) -> str:
+    """The comment for a closed case whose kørsel dates were reversed."""
+
+    return _konverterings_note(
+        "lukket sag — byttede datoer",
+        f"Kilden havde BevillingFra {fra} EFTER BevillingTil {til}.",
+        f"Datoerne er byttet om, så perioden blev {til} til {fra}.",
+        "PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers ikke "
+        "kunne oprettes. Kontrollér perioden, hvis den får betydning.",
+    )
+
+
 def _lukket_sag_note(kilde: str, adresse_tekst: str) -> str:
     """The comment left on a closed case converted onto the student's address."""
 
@@ -2299,6 +2311,8 @@ def retrieve_items_for_queue() -> list[dict]:
     ambiguous_cases: list[str] = []
     klub_rows = 0
     klub_bevillinger = 0
+    byttede_datoer = 0
+    omvendte_datoer: set[str] = set()
     noterede_rows = 0
     lukkede_konverteret = 0
 
@@ -2323,6 +2337,8 @@ def retrieve_items_for_queue() -> list[dict]:
         bevillinger = []
         # (bucket, [(kilde, match)]) per bevilling — for the queue log below.
         adresse_log: list[tuple[str, list[tuple[str, str | None]]]] = []
+        sag_lukket = str(ppr_case_id).strip() in lukkede_sager
+
         for bev_key, bev_iter in groupby(case_rows, key=bucket_of):
             bev_rows = list(bev_iter)
             first = bev_rows[0]
@@ -2381,6 +2397,30 @@ def retrieve_items_for_queue() -> list[dict]:
                     for col, val in row.items()
                     if col in _KOERSELSRAEKKE_FIELDS
                 }
+
+                # Reversed kørsel dates. The API rejects gyldig_fra after
+                # gyldig_til outright, so the row cannot be created as it
+                # stands.
+                #
+                # On a CLOSED case that is a dead end: nobody can correct the
+                # source, and refusing loses the row for good. The two dates
+                # are almost certainly transposed — swapping them yields a
+                # plausible period and keeps both original values — so they
+                # are swapped and the kørselsrække says exactly what happened.
+                #
+                # An OPEN case is left alone. bevilling_creation then fails it
+                # before anything is written, and someone fixes the source.
+                fra, til = koersel.get("BevillingFra"), koersel.get("BevillingTil")
+
+                if fra and til and fra > til:
+                    if sag_lukket:
+                        koersel["BevillingFra"], koersel["BevillingTil"] = til, fra
+                        koersel["Kommentar"] = _extend_kommentar(
+                            koersel.get("Kommentar"), _byttede_datoer_note(fra, til)
+                        )
+                        byttede_datoer += 1
+                    else:
+                        omvendte_datoer.add(str(ppr_case_id))
 
                 # Where this row's address was only resolved by assuming a
                 # floor the source never recorded, the kørselsrække says so.
@@ -2581,6 +2621,25 @@ def retrieve_items_for_queue() -> list[dict]:
             "the befordring must be rebuilt by hand.\n",
             klub_bevillinger,
             klub_rows,
+        )
+
+    if byttede_datoer:
+        logger.warning(
+            "%d kørselsrække(r) on CLOSED cases had BevillingFra after "
+            "BevillingTil. The dates were swapped so the row could be "
+            "created at all — a closed case cannot be corrected at source — "
+            "and each says so in its comment.\n",
+            byttede_datoer,
+        )
+
+    if omvendte_datoer:
+        logger.warning(
+            "%d OPEN case(s) have a kørselsrække with BevillingFra after "
+            "BevillingTil. These are rejected rather than guessed at: correct "
+            "the dates in BefordringsData, or add the case to "
+            "Lukkede foranstaltningsmapper.csv if it is in fact closed:\n%s\n",
+            len(omvendte_datoer),
+            "\n".join(f"  {c}" for c in sorted(omvendte_datoer)),
         )
 
     if lukkede_konverteret:

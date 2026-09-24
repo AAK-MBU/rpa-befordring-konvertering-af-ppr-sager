@@ -450,6 +450,28 @@ Deliberately narrow, in two ways:
 - **Only an ambiguity, never a miss.** Choosing among candidates that already matched keeps the answer consistent with the source. Where *nothing* matched, CPR's address is not among the candidates, and taking it would invent an address the source never supported — `Hørret Byvej 15` with CPR saying `15A` stays unresolved, because that is precisely the case a caseworker must look at.
 - **Only on agreement.** Several students can share one legacy address. If their CPR addresses point at different candidates, that is a new disagreement rather than an answer, and it stays unresolved with both shown.
 
+### Reversed kørsel dates
+
+The API rejects `gyldig_fra` after `gyldig_til` outright, so such a row cannot be created.
+
+**Checked before the bevilling is written**, alongside the lookups. It used to surface as a 400 during the POST loop, which left a bevilling created with no kørselsrækker — and the retry then adopted that bevilling and failed on it again, every time. Exactly the failure the pre-create pass exists to prevent; date ranges had simply been left out of it.
+
+What happens then depends on whether the case is closed:
+
+- **Closed** — the dates are swapped and the row is created. Nobody can correct the source, and refusing loses the row for good. Transposed dates are the overwhelmingly likely explanation, swapping yields a plausible period and keeps both original values, and the kørselsrække records it:
+
+  ```
+  KONVERTERING-PPR | lukket sag — byttede datoer
+  Kilden havde BevillingFra 2020-06-30 EFTER BevillingTil 2019-08-01.
+  Datoerne er byttet om, så perioden blev 2019-08-01 til 2020-06-30.
+  PPR-sagen er lukket og kan ikke rettes, og rækken ville ellers ikke kunne
+  oprettes. Kontrollér perioden, hvis den får betydning.
+  ```
+
+- **Open** — left alone and the case is rejected, with the case ids listed in the run log. Someone can fix the source, and guessing on a live bevilling is not worth it.
+
+Note the closed-case list is used in **two** places now: here in `queue_handler`, and for the address fallback. `bevilling_creation` still knows nothing about it — all the data repair happens at queue time, and creation only validates and posts.
+
 ### Closed PPR cases
 
 `BefordringsData` does not say whether a case is still open, so the list is exported from ESDH by hand into `Lukkede foranstaltningsmapper.csv` — `Sags ID` matching `CaseID`, and `Status`, where only rows saying `Lukket` count. Path in `config.CLOSED_CASES_CSV`. Gitignored; read with `utf-8-sig`, since an export opened in Excel carries a BOM that would otherwise make `Sags ID` unfindable.
