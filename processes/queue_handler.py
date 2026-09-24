@@ -976,6 +976,63 @@ def _cpr_korrektion_note(kilde: str, valgt: str) -> str:
     )
 
 
+def _vaelg_eneste_raekke(entry: dict) -> tuple[str, str] | None:
+    """Take the single address at that street and house number.
+
+        source     Poul M. Møllers Vej 33, st, 8000 Aarhus C
+        register   Poul Martin Møllers Vej 33, 8000 Aarhus C   <- no floor at all
+
+    The source names a floor the register does not use, because there is only
+    one dwelling at the number and nothing to distinguish. _matches must
+    refuse that — a source middle with no counterpart is exactly how a wrong
+    flat would otherwise match — but when the register holds EXACTLY ONE row
+    at the street and house number, there is no other dwelling it could be.
+
+    Uniqueness is the whole safety here. A block of flats returns several
+    rows, none of them matching a floor the source got wrong, and this
+    refuses; only an address with a single dwelling gets through.
+
+    Street and postcode must still be equal. The rows come from prefixes
+    built on the source's own street, so that is nearly given, but a street
+    variant could have reached a neighbour and this makes it explicit.
+    """
+
+    if entry.get("count"):
+        return None
+
+    raekker = list((entry.get("raekker") or {}).values())
+
+    if len(raekker) != 1:
+        return None
+
+    kilde = list(entry["key"])
+    kandidat = _components(raekker[0].get("adresse_tekst"))
+
+    if len(kandidat) < 2:
+        return None
+
+    if _canon(kandidat[0]) != _canon(kilde[0]):
+        return None
+
+    if _postcode_of(kandidat) != _postcode_of(kilde):
+        return None
+
+    return raekker[0]["adresse_id"], raekker[0].get("adresse_tekst") or ""
+
+
+def _eneste_raekke_note(kilde: str, valgt: str) -> str:
+    """The comment for an address taken because it was the only one there."""
+
+    return _konverterings_note(
+        "eneste adresse på vej og husnummer",
+        f"Kilde: {kilde}",
+        "Kildens etage/dør findes ikke i adresseregistret — der er kun én "
+        "bolig på vejen og husnummeret.",
+        f"Valgt: {valgt}",
+        "Kontrollér at det er den rigtige bolig.",
+    )
+
+
 def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
     """Settle an ambiguity where every candidate sits at the same point.
 
@@ -1684,6 +1741,16 @@ def _resolve_adresse_ids(
                     metode = "cpr-korrektion"
 
             if valgt is None:
+                # Then: the register holds exactly one address at that street
+                # and house number, and the source named a floor it does not
+                # use. Nothing else it could be.
+                valgt = _vaelg_eneste_raekke(entry)
+
+                if valgt is not None:
+                    metode = "eneste-raekke"
+                    note = _eneste_raekke_note(entry["kilde"], valgt[1])
+
+            if valgt is None:
                 # Then coordinates. This one is an ASSUMPTION, not an answer:
                 # the flat is probably wrong, the position is right, and the
                 # kørselsrække says so.
@@ -1728,6 +1795,13 @@ def _resolve_adresse_ids(
                 logger.info(
                     "  %s: ingen søgning ramte, men kilden er tegn for tegn "
                     "elevens registrerede adresse %r — valgt.\n",
+                    entry["kilde"],
+                    adresse_tekst,
+                )
+            elif metode == "eneste-raekke":
+                logger.info(
+                    "  %s: kildens etage/dør findes ikke, men registret har "
+                    "kun én bolig på vej og husnummer — valgt %r.\n",
                     entry["kilde"],
                     adresse_tekst,
                 )

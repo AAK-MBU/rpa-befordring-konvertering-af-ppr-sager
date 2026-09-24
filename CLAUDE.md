@@ -360,8 +360,9 @@ An address is resolved by the first of these that answers. Each step is weaker t
 | 2 | several matched, CPR names one of them | CPR |
 | 3 | none matched, but the source **is** the student's registered address once separators are dropped | CPR, no search involved |
 | 4 | none matched, CPR names a row at the same street and house number | CPR |
-| 5 | several matched and all sit at the same coordinate | position only |
-| 6 | the case is closed and LOIS knows the student | the student's current address |
+| 5 | none matched, and the register holds exactly **one** address at that street and house number | uniqueness |
+| 6 | several matched and all sit at the same coordinate | position only |
+| 7 | the case is closed and LOIS knows the student | the student's current address |
 | — | otherwise | rejected for manual follow-up |
 
 **Every address whose match required an inference carries a comment on its kørselsrækker**, saying what was read into the source and asking a caseworker to check. Steps 2–5 always do. Step 1 does only when `_er_i_praksis_samme` says the two texts are not simply the same address written differently.
@@ -495,6 +496,21 @@ Adressen findes ikke som skrevet i adresseregistret — etage/dør passer ikke.
 Eleven er iflg. CPR registreret på: Steen Billes Gade 8, 3., 8200 Aarhus N
 Samme vej og husnummer, så bevillingen er oprettet der.
 ```
+
+### A floor on an address that has none
+
+```
+source     Poul M. Møllers Vej 33, st, 8000 Aarhus C
+register   Poul Martin Møllers Vej 33, 8000 Aarhus C     <- no floor at all
+```
+
+The source names a floor the register does not use, because there is only one dwelling at the number and nothing to distinguish. `_matches` must refuse that — a source middle with no counterpart is exactly how a wrong flat would otherwise match — but when the register holds **exactly one** row at the street and house number, there is no other dwelling it could be.
+
+Uniqueness is the entire safety. A block of flats returns several rows, none matching a floor the source got wrong, and this refuses: `Blokvej 4, 3. mf` against a register holding only `1. th`, `1. tv` and `2. th` stays unresolved. Only a single-dwelling address gets through.
+
+Street and postcode must still be equal. The rows come from prefixes built on the source's own street, so that is nearly given, but a street variant could have reached a neighbour and the check makes it explicit.
+
+Always commented — the source said something the register does not confirm.
 
 ### A missing floor, resolved by coordinates
 
