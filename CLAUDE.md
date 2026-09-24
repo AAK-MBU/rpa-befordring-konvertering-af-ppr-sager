@@ -294,20 +294,58 @@ This bot used to `POST /citizen/create_elev` with just `{cpr, adresse_id}`. That
 
 So a miss now raises `BusinessError`, which sends the item to `pending_user` rather than failing it. Nothing the bot can do resolves it; a person has to decide whether that student should be converted at all.
 
+### Every conversion comment is marked
+
+Each comment this bot writes onto a kørselsrække begins with the same string, and nothing else in the application writes it:
+
+```
+KONVERTERING-PPR | <what kind of note this is>
+<the detail>
+```
+
+So the full list of converted bevillinger needing a look is one query:
+
+```sql
+SELECT DISTINCT b.bevilling_id, b.cpr_elev, b.esdh_noegle, k.koersel_id, k.kommentar
+FROM   befordring.Koersel   k
+JOIN   befordring.Bevilling b ON b.bevilling_id = k.bevilling_id
+WHERE  k.kommentar LIKE '%KONVERTERING-PPR%'
+ORDER  BY b.cpr_elev, b.bevilling_id;
+```
+
+**No square brackets, percent signs or underscores in the marker, on purpose.** All three are metacharacters in T-SQL `LIKE`, and a marker containing them would silently match far more than intended — `LIKE '%[KONVERTERING]%'` matches any single one of those letters.
+
+The kinds, which is the text after the pipe:
+
+| `emne` | written when |
+|---|---|
+| `adressematch` | resolved to one row, but not word for word |
+| `adresse valgt via CPR` | several rows fitted; CPR chose |
+| `adresse rettet via CPR` | the source's floor/door matched nothing; CPR named the row |
+| `adresse antaget — manglende etage/dør` | several rows at one coordinate; the flat is a guess |
+| `lukket sag — elevens nuværende adresse` | closed case, address unresolvable, student's own address used |
+| `klub i kildedata` | the row named a klub in `ElevensAdresse` or `SkoleNavnBefordring` |
+
+Every builder goes through `_konverterings_note`, so the marker cannot be left off a new one. A kørselsrække can carry more than one — a klub row whose address also needed normalising gets both — and any caseworker text already on the row is kept above them.
+
 ### Resolution order
 
 An address is resolved by the first of these that answers. Each step is weaker than the one above it, and everything below the first is recorded on the kørselsrække:
 
-| # | step | evidence | comment left? |
-|---|---|---|---|
-| 1 | exactly one register row matches | the source itself | no |
-| 2 | several matched, CPR names one of them | CPR | no — it is the student's actual dwelling |
-| 3 | none matched, CPR names a row at the same street and house number | CPR | yes — the source's floor/door was wrong |
-| 4 | several matched and all sit at the same coordinate | position only | yes — the flat is a guess |
-| 5 | the case is closed and LOIS knows the student | the student's current address | yes — the bevilling is inactive and uncorrectable |
-| — | otherwise | — | rejected for manual follow-up |
+| # | step | evidence |
+|---|---|---|
+| 1 | exactly one register row matches | the source itself |
+| 2 | several matched, CPR names one of them | CPR |
+| 3 | none matched, CPR names a row at the same street and house number | CPR |
+| 4 | several matched and all sit at the same coordinate | position only |
+| 5 | the case is closed and LOIS knows the student | the student's current address |
+| — | otherwise | rejected for manual follow-up |
 
-Steps 3–5 each convert something that would otherwise be lost, and each says in the kørselsrække's comment exactly what was assumed and why. Nothing below step 2 is presented as correct.
+**Every address that was not found word for word carries a comment on its kørselsrækker**, saying what was inferred and asking a caseworker to check. The only silent case is step 1 where the source text and the register text are identical but for case and spacing — nothing was inferred, so there is nothing to check.
+
+That deliberately includes step 1 matches that relied on normalisation. `Blomsterlunden 143,1,-2` resolves to exactly one row, but it took punctuation rules to get there, so it is flagged. So is `Kærlundvej 16` matching `Kærlundvej 16, Ormslev`, where the register simply knows more than the source did.
+
+The comment names the method, so the cheap checks are distinguishable from the real ones: a normalised match reads differently from a coordinate guess, which reads differently again from a closed case placed on the student's current address.
 
 ### How addresses are matched
 
@@ -555,6 +593,22 @@ Two guards on the rule:
 
 - **Runs of at most three digits.** A four-digit run is postcode-shaped, and Denmark does have postcodes beginning with zero — `0800`, and the `0900`–`0999` København C range. `_canon` is not applied to the postcode component either, so that is two independent guards.
 - **Stripped before the spaces are collapsed.** Once `"vestergade 041"` has become `"vestergade041"` the zero is no longer recognisable as leading, and the rule would either do nothing or hit the wrong digits.
+
+### Floor and door split across components
+
+The register writes floor and door as **one** component; the source sometimes writes them as two, and sometimes hyphenates them:
+
+| source | register |
+|---|---|
+| `Kamma Klitgårds Gade 107, st, -1` | `Kamma Klitgårds Gade 107, st. 1` |
+| `Blomsterlunden 143, 1, -2` | `Blomsterlunden 143, 1. 2` |
+| `Langenæs Allé 21, 4-3` | `Langenæs Allé 21, 4. 3` |
+
+Nothing matches while the counts differ, because every source middle must turn up among the candidate's middles and `st` is not `st. 1`. `_saml_etage_doer` merges them into the register's own shape, treating a hyphen inside a component exactly as it treats a comma between two.
+
+Only middles, and only when **every** one of them is a floor-or-door token (a number, or `st`/`kl`/`kld`/`th`/`tv`/`mf`). That is what keeps it off `Kærlundvej 16, Ormslev, 8260 Viby J` and `Bøgebakken 2, 4, Allerslev, 4320 Lejre`, where a middle is a place name.
+
+Worth knowing why this matters beyond the one address that failed: all thirteen of these were misses, and the twelve that appeared to "work" were being rescued by CPR at step 3 — right answer, but only because those students had not moved, and each one flagged for manual review it did not need. Merging makes all thirteen resolve from the source alone.
 
 ### A floor with no comma before it
 

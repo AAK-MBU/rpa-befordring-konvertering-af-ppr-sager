@@ -82,6 +82,20 @@ Alle kald autentificeres med `X-API-Key`.
 | nyeste `Modified` i gruppen | `sagsbehandlingsdato` | hvornår bevillingen sidst blev behandlet — den nyeste af gruppens rækker, ikke den første |
 | `CaseID` | `esdh_noegle` | PPR-sagens id, som også bruges til dublettjek |
 
+## Alle konverteringskommentarer er mærket
+
+Hver kommentar, robotten skriver på en kørselsrække, begynder med `KONVERTERING-PPR | <type>`. Intet andet i applikationen skriver den tekst, så hele listen over konverterede bevillinger, der skal ses efter, er ét opslag:
+
+```sql
+SELECT DISTINCT b.bevilling_id, b.cpr_elev, b.esdh_noegle, k.koersel_id, k.kommentar
+FROM   befordring.Koersel   k
+JOIN   befordring.Bevilling b ON b.bevilling_id = k.bevilling_id
+WHERE  k.kommentar LIKE '%KONVERTERING-PPR%'
+ORDER  BY b.cpr_elev, b.bevilling_id;
+```
+
+Typen står efter lodret streg: `adressematch`, `adresse valgt via CPR`, `adresse rettet via CPR`, `adresse antaget — manglende etage/dør`, `lukket sag — elevens nuværende adresse` og `klub i kildedata`. En kørselsrække kan have flere, og sagsbehandlerens egen tekst bevares øverst.
+
 ## Manuelle adresserettelser
 
 `adresse_erstatninger.csv` med kolonnerne `Find` og `Erstat` retter formuleringer, ingen regel kan udlede — fx et forkortet vejnavn:

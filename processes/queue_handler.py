@@ -97,6 +97,10 @@ _STREET_THEN_FLOOR = re.compile(
 # happens to contain "sal" is untouched.
 _FLOOR_SAL = re.compile(r"^(\d+)\.?\s*sal\b")
 
+# One floor-or-door token: a number, or st/kl/kld/th/tv/mf, with or without a
+# trailing period and with or without a leading hyphen.
+_ETAGE_DOER = re.compile(r"^-?(?:\d{1,3}|st|kl|kld|th|tv|mf)\.?$")
+
 # Anything outside the characters a Danish address is actually written with.
 # Used only to decide whether an unresolved address should be logged as a
 # repr as well: a zero-width space, a soft hyphen or a decomposed "å" makes a
@@ -360,6 +364,47 @@ def _override_adresse(tekst: str | None) -> str | None:
     return None
 
 
+def _saml_etage_doer(components: list[str]) -> list[str]:
+    """Merge a floor and door the source split across separate components.
+
+    The register writes floor and door as ONE component; the source sometimes
+    writes them as two, and sometimes hyphenates them:
+
+        Kamma Klitgårds Gade 107, st, -1   ->  register: 107, st. 1
+        Blomsterlunden 143, 1, -2          ->  register: 143, 1. 2
+        Langenæs Allé 21, 4-3              ->  register: 21, 4. 3
+
+    Nothing matches while the counts differ, because every source middle has
+    to turn up among the candidate's middles and "st" is not "st. 1". Merged
+    into the register's own shape, they match exactly — no CPR, no coordinate
+    guess, and no dependence on where the student happens to live now.
+
+    Only middles, and only when EVERY one of them is a floor-or-door token.
+    That is what keeps it away from "Kærlundvej 16, Ormslev, 8260 Viby J",
+    where the middle is a place name and merging would destroy the address.
+    """
+
+    if len(components) < 3:
+        # No middle at all — street and postcode only.
+        return components
+
+    midt = components[1:-1]
+
+    # A hyphen inside a component separates floor from door just as a comma
+    # does, so "4-3" and ("1", "-2") arrive at the same place.
+    flad: list[str] = []
+
+    for part in midt:
+        flad.extend(stykke for stykke in part.split("-") if stykke.strip())
+
+    if len(flad) < 2 or not all(_ETAGE_DOER.match(s) for s in flad):
+        return components
+
+    samlet = f"{flad[0].rstrip('.')}. {' '.join(flad[1:])}"
+
+    return [components[0], samlet, components[-1]]
+
+
 def _address_key(row: dict) -> tuple[str, ...] | None:
     """The normalised components of the address a row's bevilling is for.
 
@@ -395,6 +440,9 @@ def _address_key(row: dict) -> tuple[str, ...] | None:
 
     if len(components) < 2:
         return None
+
+    # After the postcode, so a source with none of its own is merged too.
+    components = _saml_etage_doer(components)
 
     return tuple(components)
 
@@ -823,16 +871,43 @@ def _vaelg_via_cpr_uden_match(
     return adresse_id, raekker[adresse_id].get("adresse_tekst") or ""
 
 
+# Every comment this conversion writes begins with this exact string, and
+# nothing else in the application writes it. It is what makes the converted
+# rows findable afterwards:
+#
+#     SELECT DISTINCT b.bevilling_id
+#     FROM   befordring.Koersel k
+#     JOIN   befordring.Bevilling b ON b.bevilling_id = k.bevilling_id
+#     WHERE  k.kommentar LIKE '%KONVERTERING-PPR%';
+#
+# No square brackets, percent signs or underscores on purpose: all three are
+# metacharacters in T-SQL LIKE, and a marker containing them would silently
+# match far more than intended.
+_KONVERTERING_MARKOER = "KONVERTERING-PPR"
+
+
+def _konverterings_note(emne: str, *linjer: str) -> str:
+    """One comment from the conversion, marked so it can be found again.
+
+    Every note goes through here, so the marker cannot be forgotten on a new
+    one, and the second field names the KIND of note — a caseworker scanning
+    the list can tell a punctuation match from an assumed flat without
+    reading the body.
+    """
+
+    return "\n".join([f"{_KONVERTERING_MARKOER} | {emne}", *linjer])
+
+
 def _cpr_korrektion_note(kilde: str, valgt: str) -> str:
     """The comment left on a kørselsrække whose door came from CPR."""
 
-    return (
-        "Adresse fra foranstaltningsdata konvertering:\n"
-        f"Kilde: {kilde}\n"
+    return _konverterings_note(
+        "adresse rettet via CPR",
+        f"Kilde: {kilde}",
         "Adressen findes ikke som skrevet i adresseregistret — etage/dør "
-        "passer ikke.\n"
-        f"Eleven er iflg. CPR registreret på: {valgt}\n"
-        "Samme vej og husnummer, så bevillingen er oprettet der."
+        "passer ikke.",
+        f"Eleven er iflg. CPR registreret på: {valgt}",
+        "Samme vej og husnummer, så bevillingen er oprettet der.",
     )
 
 
@@ -882,29 +957,69 @@ def _vaelg_via_koordinater(entry: dict) -> tuple[str, str] | None:
     return valgt["adresse_id"], valgt.get("adresse_tekst") or ""
 
 
+def _er_samme_tekst(a: str | None, b: str | None) -> bool:
+    """Whether two address strings are the same but for case and spacing.
+
+    The test for "was anything actually inferred". Deliberately strict:
+    everything the matcher does beyond case and whitespace — punctuation,
+    floor and door, abbreviations, zero padding, a place name the register
+    adds — counts as work that a caseworker should be able to see and check.
+    """
+
+    return " ".join(str(a or "").split()).casefold() == " ".join(
+        str(b or "").split()
+    ).casefold()
+
+
+def _generel_adresse_note(kilde: str, valgt: str) -> str:
+    """The comment for an address that matched, but not word for word."""
+
+    return _konverterings_note(
+        "adressematch",
+        f"Kilde: {kilde}",
+        f"Fundet i adresseregistret som: {valgt}",
+        "Teksterne er ikke ens — adressen er slået op ved at normalisere "
+        "stavemåde, tegnsætning og etage/dør. Kontrollér at det er den "
+        "rigtige bolig.",
+    )
+
+
+def _cpr_valg_note(kilde: str, antal: int, valgt: str) -> str:
+    """The comment for an ambiguity that CPR chose between."""
+
+    return _konverterings_note(
+        "adresse valgt via CPR",
+        f"Kilde: {kilde}",
+        f"{antal} boliger i adresseregistret passede lige godt på kilden.",
+        f"Valgt: {valgt}",
+        "Valgt fordi CPR har eleven registreret der. Kontrollér at det er "
+        "den rigtige bolig.",
+    )
+
+
 def _lukket_sag_note(kilde: str, adresse_tekst: str) -> str:
     """The comment left on a closed case converted onto the student's address."""
 
-    return (
-        "Adresse fra foranstaltningsdata konvertering:\n"
-        f"Kilde: {kilde}\n"
+    return _konverterings_note(
+        "lukket sag — elevens nuværende adresse",
+        f"Kilde: {kilde}",
         "Adressen kunne ikke findes i adresseregistret, og PPR-sagen er "
-        "lukket og kan derfor ikke rettes.\n"
+        "lukket og kan derfor ikke rettes.",
         "Bevillingen er i stedet oprettet på elevens nuværende adresse: "
-        f"{adresse_tekst}"
+        f"{adresse_tekst}",
     )
 
 
 def _upraecis_note(kilde: str, antal: int, valgt: str) -> str:
     """The comment left on a kørselsrække whose address was assumed."""
 
-    return (
-        "Adresse fra foranstaltningsdata konvertering:\n"
-        f"Kilde: {kilde}\n"
+    return _konverterings_note(
+        "adresse antaget — manglende etage/dør",
+        f"Kilde: {kilde}",
         f"Adressen mangler etage/dør og passede på {antal} boliger i "
-        "adresseregistret, som alle har samme placering.\n"
-        f"Valgt: {valgt}\n"
-        "Placeringen er dermed korrekt, men boligen skal rettes manuelt."
+        "adresseregistret, som alle har samme placering.",
+        f"Valgt: {valgt}",
+        "Placeringen er dermed korrekt, men boligen skal rettes manuelt.",
     )
 
 
@@ -1229,7 +1344,7 @@ def _resolve_adresse_ids(
     tekster: dict[str, str] = {}
     # key -> the comment its kørselsrækker must carry, for an address resolved
     # only by assuming a floor the source never recorded.
-    upraecise: dict[tuple[str, ...], str] = {}
+    adresse_noter: dict[tuple[str, ...], str] = {}
     unresolved: list[tuple] = []
 
     for key in sorted(keys):
@@ -1242,7 +1357,7 @@ def _resolve_adresse_ids(
             tekster[adresse_id] = adresse_tekst
 
             if note:
-                upraecise[key] = note
+                adresse_noter[key] = note
 
             fra_cache += 1
             continue
@@ -1311,6 +1426,19 @@ def _resolve_adresse_ids(
             resolved[key] = adresse_id
             tekster[adresse_id] = adresse_tekst
 
+            # Anything short of a word-for-word match means the matcher
+            # inferred something — punctuation, a floor, an abbreviation, a
+            # place name the register adds. The kørselsrække says so, so a
+            # caseworker can check every address that was not simply found.
+            note = (
+                ""
+                if _er_samme_tekst(kilder[key], adresse_tekst)
+                else _generel_adresse_note(kilder[key], adresse_tekst)
+            )
+
+            if note:
+                adresse_noter[key] = note
+
             # Written now, not at the end: a run over thousands of addresses
             # that dies half way should keep what it had. Successes only —
             # a failure must be retried on the next run, which is exactly what
@@ -1321,7 +1449,7 @@ def _resolve_adresse_ids(
                     adresse_id,
                     adresse_tekst,
                     kilder[key],
-                    "",
+                    note,
                 ])
                 cache_fil.flush()
 
@@ -1409,6 +1537,9 @@ def _resolve_adresse_ids(
             note = ""
             metode = "cpr"
 
+            if valgt is not None:
+                note = _cpr_valg_note(entry["kilde"], entry["count"], valgt[1])
+
             if valgt is None:
                 # Then CPR again, for a miss rather than an ambiguity: the
                 # source's floor and door match nothing, but CPR names a row
@@ -1440,7 +1571,7 @@ def _resolve_adresse_ids(
             tekster[adresse_id] = adresse_tekst
 
             if note:
-                upraecise[entry["key"]] = note
+                adresse_noter[entry["key"]] = note
 
             if cache_writer is not None:
                 cache_writer.writerow([
@@ -1503,7 +1634,7 @@ def _resolve_adresse_ids(
 
     raise SystemExit("Manual stop")
 
-    return resolved, tekster, upraecise
+    return resolved, tekster, adresse_noter
 
 
 # Places whose appearance in ElevensAdresse or SkoleNavnBefordring means the
@@ -1552,10 +1683,10 @@ def _klub_note(row: dict) -> str | None:
     if not any(_fold(marker) in haystack for marker in _KLUB_MARKERS):
         return None
 
-    return (
-        "Fra foranstaltningsdata konvertering:\n"
-        f"ElevensAdresse: {str(adresse or '').strip()}\n"
-        f"SkoleNavnBefordring: {str(skole or '').strip()}"
+    return _konverterings_note(
+        "klub i kildedata",
+        f"ElevensAdresse: {str(adresse or '').strip()}",
+        f"SkoleNavnBefordring: {str(skole or '').strip()}",
     )
 
 
@@ -1689,7 +1820,7 @@ def retrieve_items_for_queue() -> list[dict]:
     logger.info("Fetched %d row(s) from BefordringsData.\n", len(rows))
 
     # --- Resolve every distinct address up front ---
-    adresse_ids, adresse_tekster, upraecise_adresser = _resolve_adresse_ids(rows)
+    adresse_ids, adresse_tekster, adresse_noter = _resolve_adresse_ids(rows)
 
     # Closed PPR cases whose address will not resolve.
     #
@@ -1756,7 +1887,7 @@ def retrieve_items_for_queue() -> list[dict]:
     items = []
     ambiguous_cases: list[str] = []
     klub_rows = 0
-    upraecise_rows = 0
+    noterede_rows = 0
     lukkede_konverteret = 0
 
     # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
@@ -1845,10 +1976,10 @@ def retrieve_items_for_queue() -> list[dict]:
                 # floor the source never recorded, the kørselsrække says so.
                 # Per row, like the klub note: it is this journey's address
                 # that was guessed at.
-                adresse_note = upraecise_adresser.get(_address_key(row) or ())
+                adresse_note = adresse_noter.get(_address_key(row) or ())
 
                 if adresse_note:
-                    upraecise_rows += 1
+                    noterede_rows += 1
 
                 koersel["Kommentar"] = _extend_kommentar(
                     koersel.get("Kommentar"), adresse_note
@@ -2015,14 +2146,15 @@ def retrieve_items_for_queue() -> list[dict]:
             lukkede_konverteret,
         )
 
-    if upraecise_rows:
+    if noterede_rows:
         logger.warning(
-            "%d kørselsrække(r) have an address that was missing its floor "
-            "and door. Every candidate in the register sat at the same point, "
-            "so the position on the bevilling is right and the walking "
-            "distance will be too — but the dwelling is a guess, and each of "
-            "these carries a comment asking a caseworker to correct it.\n",
-            upraecise_rows,
+            "%d kørselsrække(r) carry a comment about their address. Every "
+            "address that was not found word for word gets one — normalised "
+            "punctuation, a floor derived from the source, a choice made on "
+            "CPR or on coordinates, or a closed case placed on the student's "
+            "current address. The comment says which, so a caseworker can "
+            "check the ones that need it.\n",
+            noterede_rows,
         )
 
     if ambiguous_cases:
