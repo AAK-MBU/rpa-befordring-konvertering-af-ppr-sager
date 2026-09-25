@@ -20,7 +20,9 @@ For every distinct CPR in BefordringsData it answers two questions:
     in LOIS?    LOIS.CPR.PersonGeoView on server 29, the same view the
                 nightly run uses. A miss means no fallback address, so a klub
                 row or a closed case with an unresolvable address has nothing
-                to fall back on.
+                to fall back on. Status_T is reported alongside: CPR's own
+                status text, which is often what explains a row that looks
+                wrong for no visible reason.
 
 The two are independent and fail differently, which is why they are reported
 separately rather than as one "known" flag.
@@ -50,6 +52,7 @@ FELTER = (
     "cpr",
     "i_elev",
     "i_lois",
+    "lois_status",
     "lois_adresse_id",
     "antal_raekker",
     "ppr_sager",
@@ -101,13 +104,17 @@ def _hent_cprs() -> tuple[dict[str, int], dict[str, set[str]], int]:
     return dict(antal), dict(sager), uden_cpr
 
 
-def _lois_status(cprs: list[str], chunk: int = 900) -> dict[str, str | None]:
-    """cpr -> AdresseId (possibly None) for everyone PersonGeoView knows.
+def _lois_status(cprs: list[str], chunk: int = 900) -> dict[str, dict]:
+    """cpr -> {"adresse_id", "status"} for everyone PersonGeoView knows.
 
     A CPR absent from the result is absent from the view. Note the difference
     from the conversion's own lookup, which filters AdresseId IS NOT NULL:
     here a person known to CPR but without a resolved address is a distinct
     and useful case, so the filter is deliberately left off.
+
+    Status_T is CPR's own status text. Carried through verbatim rather than
+    interpreted — it is the column that explains an otherwise puzzling row,
+    where a student is in the view but something about them is not ordinary.
     """
 
     conn_string = os.getenv("DBCONNECTIONSTRINGSERVER29")
@@ -120,7 +127,7 @@ def _lois_status(cprs: list[str], chunk: int = 900) -> dict[str, str | None]:
 
         return {}
 
-    fundet: dict[str, str | None] = {}
+    fundet: dict[str, dict] = {}
 
     with pyodbc.connect(conn_string) as conn:
         cursor = conn.cursor()
@@ -131,18 +138,21 @@ def _lois_status(cprs: list[str], chunk: int = 900) -> dict[str, str | None]:
 
             cursor.execute(
                 f"""
-                SELECT [PNR_0], CONVERT(NVARCHAR(36), [AdresseId])
+                SELECT [PNR_0], CONVERT(NVARCHAR(36), [AdresseId]), [Status_T]
                 FROM   [LOIS].[CPR].[PersonGeoView]
                 WHERE  [PNR_0] IN ({placeholders})
                 """,
                 batch,
             )
 
-            for pnr, adresse_id in cursor.fetchall():
+            for pnr, adresse_id, status in cursor.fetchall():
                 rent = _cpr_cifre(pnr)
 
                 if rent:
-                    fundet[rent] = str(adresse_id).strip() if adresse_id else None
+                    fundet[rent] = {
+                        "adresse_id": str(adresse_id).strip() if adresse_id else "",
+                        "status": str(status).strip() if status else "",
+                    }
 
             logger.info("LOIS: %d/%d checked", min(offset + chunk, len(cprs)), len(cprs))
 
@@ -291,8 +301,9 @@ def _skriv(raekker: list[dict], stamme: str) -> None:
     for raekke in raekker:
         ws.append([raekke[felt] for felt in FELTER])
 
-    bredder = {"cpr": 14, "i_elev": 10, "i_lois": 10, "lois_adresse_id": 38,
-               "antal_raekker": 14, "ppr_sager": 46, "vurdering": 52}
+    bredder = {"cpr": 14, "i_elev": 10, "i_lois": 10, "lois_status": 22,
+               "lois_adresse_id": 38, "antal_raekker": 14, "ppr_sager": 46,
+               "vurdering": 52}
 
     for i, felt in enumerate(FELTER, start=1):
         ws.column_dimensions[get_column_letter(i)].width = bredder.get(felt, 18)
@@ -349,11 +360,14 @@ def main() -> None:
         i_elev = elev.get(cpr)
         i_lois = cpr in lois
 
+        oplysninger = lois.get(cpr) or {}
+
         raekker.append({
             "cpr": cpr,
             "i_elev": {True: "ja", False: "nej", None: "?"}[i_elev],
             "i_lois": "ja" if i_lois else "nej",
-            "lois_adresse_id": lois.get(cpr) or "",
+            "lois_status": oplysninger.get("status", ""),
+            "lois_adresse_id": oplysninger.get("adresse_id", ""),
             "antal_raekker": antal[cpr],
             "ppr_sager": "; ".join(sorted(sager.get(cpr, ()))),
             "vurdering": _vurdering(i_elev, i_lois),
@@ -370,6 +384,22 @@ def main() -> None:
     print(f"  IKKE i LOIS       : {sum(1 for r in raekker if r['i_lois'] == 'nej')}")
     print(f"  uden adresse i LOIS: "
           f"{sum(1 for r in raekker if r['i_lois'] == 'ja' and not r['lois_adresse_id'])}")
+
+    # Every Status_T that turned up, with counts. Printed rather than judged:
+    # the values are CPR's, not ours, and seeing the spread is the point.
+    statusser: dict[str, int] = defaultdict(int)
+
+    for r in raekker:
+        if r["i_lois"] == "ja":
+            statusser[r["lois_status"] or "(tom)"] += 1
+
+    if statusser:
+        print()
+        print("  Status_T i LOIS:")
+
+        for status, n in sorted(statusser.items(), key=lambda s: (-s[1], s[0])):
+            print(f"    {n:6}  {status}")
+
     print()
 
     _skriv(raekker, args.ud)

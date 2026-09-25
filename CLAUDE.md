@@ -607,6 +607,10 @@ For every distinct CPR in `BefordringsData` it answers two independent questions
 | **in Elev?** | `befordring.Elev`, read directly | every bevilling for that student is rejected — `cpr_elev` is a trusted FK, so the row cannot be created |
 | **in LOIS?** | `LOIS.CPR.PersonGeoView` | no fallback address, so a klub row or closed case with an unresolvable address has nothing to fall back on |
 
+`Status_T` from that view is reported alongside — CPR's own status text, carried through **verbatim rather than interpreted**, since the vocabulary is CPR's and not ours. It is often what explains a row that looks wrong for no visible reason. The console prints every value that turned up with a count, so the spread is visible before anyone decides what any of them should mean.
+
+Note that `vurdering` does **not** take it into account: a student marked as having moved abroad still reads `ok` if they are in both sources. Once the real values are known, the meaningful ones are worth folding in.
+
 They fail differently, so they are reported separately rather than as one "known" flag. `vurdering` combines them into one line, and the report is sorted worst-first.
 
 Deliberate differences from the conversion's own LOIS lookup:
