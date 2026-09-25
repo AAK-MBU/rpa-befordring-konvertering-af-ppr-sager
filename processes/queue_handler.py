@@ -1413,7 +1413,7 @@ def _skriv_uloeste(
 
     for entry in unresolved:
         if entry.get("klub"):
-            aarsag = "klubadresse (forventet — bevilling oprettes på elevens adresse)"
+            aarsag = "klubrække (forventet — bevilling oprettes på elevens adresse)"
         elif entry.get("count"):
             aarsag = f"flertydig — {entry['count']} boliger passer lige godt"
         else:
@@ -1514,12 +1514,12 @@ def _unresolved_line(
     # problem, and the bevilling is converted on the student's own address.
     if klub:
         linjer.append(
-            "      FORVENTET    : klubadresse — en klub er ikke en bolig og "
-            "findes ikke i registret som en."
+            "      FORVENTET    : klubrække — ikke en afvisning. Klubben står "
+            "i adressen, skolenavnet eller kommentaren,"
         )
         linjer.append(
-            "                     Bevillingen oprettes på elevens egen "
-            "adresse; kørselsrækkerne får en kommentar."
+            "                     og bevillingen oprettes på elevens egen "
+            "adresse med en kommentar på kørselsrækkerne."
         )
 
     for prefix, antal, matchede in forsoeg:
@@ -1755,11 +1755,17 @@ def _resolve_adresse_ids(
     # key -> the CPRs whose rows used this address. Only needed for failures,
     # where it is what lets the log say where CPR has that student living.
     cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
-    # Keys whose ElevensAdresse names a klub. These are EXPECTED not to
-    # resolve — a klub is not a home and is not in the register as one — and
-    # the bucket loop puts those bevillinger on the student's own address
-    # instead. Tracked only so the failure log can say so rather than listing
-    # them as problems.
+    # Keys belonging to a klub-related row. These are EXPECTED not to resolve
+    # and are NOT rejections: the bucket loop puts every klub bevilling on the
+    # student's own address, so the failure costs nothing.
+    #
+    # _klub_relevant, not _klub_i_adressen — the two answer different
+    # questions. Whether a row's address may be USED is about ElevensAdresse
+    # alone; whether the failure MATTERS is about the bevilling, and a klub
+    # named in SkoleNavnBefordring or Kommentar flags it just the same.
+    #
+    # Getting this wrong made the log report "Stensagerskolen" as a rejection
+    # when the bevilling had converted perfectly on the student's address.
     klub_keys: set[tuple[str, ...]] = set()
     # key -> the PPR cases whose rows used this address. Only needed for the
     # unresolved worklist, where a caseworker needs the case to act on.
@@ -1787,7 +1793,7 @@ def _resolve_adresse_ids(
         if cpr:
             cpr_pr_adresse.setdefault(key, set()).add(cpr)
 
-        if _klub_i_adressen(row):
+        if _klub_relevant(row):
             klub_keys.add(key)
 
         sag = str(row.get("CaseID") or "").strip()
@@ -2174,10 +2180,11 @@ def _resolve_adresse_ids(
         _skriv_uloeste(unresolved, lois_adresse_id, lois_tekst)
 
         logger.warning(
-            "%d address(es) unresolved. %d of them are klub addresses, which "
-            "are EXPECTED not to resolve — those bevillinger are created on "
-            "the student's own address. The remaining %d will have their "
-            "bevillinger rejected for manual follow-up:\n%s\n",
+            "%d address(es) unresolved. %d belong to klub rows and are "
+            "EXPECTED — those bevillinger are created on the student's own "
+            "address and are NOT rejected. The remaining %d may have their "
+            "bevillinger rejected, unless another row in the same bevilling "
+            "supplies an address:\n%s\n",
             len(unresolved),
             klub_antal,
             len(unresolved) - klub_antal,
