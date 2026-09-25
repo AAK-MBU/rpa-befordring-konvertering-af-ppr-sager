@@ -591,6 +591,31 @@ It refuses whenever the coordinates differ or any is missing. Different points m
 
 The `note` column in `resolved_addresses.csv` carries the comment, so a cached hit does not silently drop the warning.
 
+### `helpers/tjek_elever.py` — are the students known to us?
+
+```
+python -m helpers.tjek_elever              # every distinct CPR
+python -m helpers.tjek_elever --limit 50   # a quick sample
+```
+
+Standalone, not part of the conversion. Writes nothing anywhere and calls no mutating endpoint. Run it **before** a conversion so the gaps are known up front rather than discovered one failed case at a time.
+
+For every distinct CPR in `BefordringsData` it answers two independent questions:
+
+| | source | what a miss means |
+|---|---|---|
+| **in Elev?** | `/citizen/stamdata/{cpr}` | every bevilling for that student is rejected — `cpr_elev` is a trusted FK, so the row cannot be created |
+| **in LOIS?** | `LOIS.CPR.PersonGeoView` | no fallback address, so a klub row or closed case with an unresolvable address has nothing to fall back on |
+
+They fail differently, so they are reported separately rather than as one "known" flag. `vurdering` combines them into one line, and the report is sorted worst-first.
+
+Deliberate differences from the conversion's own LOIS lookup:
+
+- **No `AdresseId IS NOT NULL` filter.** A person CPR knows but has no resolved address for is a distinct and useful case, and the report has a column for it.
+- **A failed API call records `?`, not "no".** A network blip must not read as "this student does not exist".
+
+There is no bulk elev endpoint, so it is one request per CPR — run in a small thread pool (`--workers`, default 8). Output is `elevtjek.csv` and `elevtjek.xlsx`.
+
 ### The unresolved worklist (`uloeste_adresser.csv`)
 
 Every address the run could not resolve, written out for the caseworkers. Path in `config.UNRESOLVED_ADDRESS_CSV`, `None` switches it off, gitignored.

@@ -96,6 +96,18 @@ ORDER  BY b.cpr_elev, b.bevilling_id;
 
 Typen står efter lodret streg: `adressematch`, `adresse valgt via CPR`, `adresse rettet via CPR`, `adresse antaget — manglende etage/dør`, `lukket sag — elevens nuværende adresse` og `klub i kildedata`. En kørselsrække kan have flere, og sagsbehandlerens egen tekst bevares øverst.
 
+## Tjek af elever før konvertering
+
+```
+python -m helpers.tjek_elever
+```
+
+Et selvstændigt script — ikke en del af konverteringen, og det skriver intet i nogen database. For hvert unikt CPR i `BefordringsData` tjekker det, om eleven findes i `Elev` (via API'et) og i LOIS' `PersonGeoView` på server 29.
+
+Mangler eleven i **Elev**, afvises alle bevillinger for den elev. Mangler eleven i **LOIS**, er der ingen reserveadresse, når en klubrække eller en lukket sag ikke kan slås op. De to fejler forskelligt og rapporteres derfor hver for sig.
+
+Resultatet skrives til `elevtjek.csv` og `elevtjek.xlsx`, sorteret så det, der kræver handling, står øverst.
+
 ## Uløste adresser til sagsbehandlerne
 
 Hver kørsel skriver de adresser, der ikke kunne slås op, til `uloeste_adresser.csv` og `uloeste_adresser.xlsx` — samme rækker i begge. Kolonner: PPR-sag, CPR, adressen som den står i BefordringsData, hvor CPR har eleven boende, årsagen, og hvad registret har på vejen.
