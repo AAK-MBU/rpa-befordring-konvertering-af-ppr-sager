@@ -2518,6 +2518,9 @@ def retrieve_items_for_queue() -> list[dict]:
             [HjemmelForBevilling], [TidspunktForBevilling],
             [BevillingAfKoerselstype], [Kommentar]
         FROM [RPA].[rpa].[BefordringsData]
+        WHERE
+            [BevillingFra] >= DATEADD(YEAR, -2, GETDATE()) AND
+            [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
         ORDER BY [CaseID] DESC
     """
 
