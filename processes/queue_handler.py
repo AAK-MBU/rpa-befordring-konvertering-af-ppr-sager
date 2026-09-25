@@ -1421,23 +1421,20 @@ def _skriv_uloeste(
 
         naboer = "; ".join(entry.get("naboer") or [])
 
-        # A case with no CPR, or an address with no case, still gets a row —
-        # a blank cell is visible, a missing row is not.
-        sager = entry.get("sager") or [""]
-        cprs = entry.get("cprs") or [""]
+        # One row per (case, student) pair that actually occurs. A pair with
+        # one half missing still gets a row — a blank cell is visible, a
+        # missing row is not.
+        for sag, cpr in entry.get("par") or [("", "")]:
+            adresse_id = lois_adresse_id.get(cpr, "")
 
-        for sag in sager:
-            for cpr in cprs:
-                adresse_id = lois_adresse_id.get(cpr, "")
-
-                raekker.append({
-                    "ppr_sag": sag,
-                    "cpr": cpr,
-                    "kilde_adresse": entry.get("kilde", ""),
-                    "elev_adresse_iflg_cpr": lois_tekst.get(adresse_id, ""),
-                    "aarsag": aarsag,
-                    "registret_har": naboer,
-                })
+            raekker.append({
+                "ppr_sag": sag,
+                "cpr": cpr,
+                "kilde_adresse": entry.get("kilde", ""),
+                "elev_adresse_iflg_cpr": lois_tekst.get(adresse_id, ""),
+                "aarsag": aarsag,
+                "registret_har": naboer,
+            })
 
     # By case, not by address: the file is worked through a case at a time,
     # and the resolver's own order is alphabetical by normalised address.
@@ -1482,7 +1479,7 @@ def _unresolved_line(
     kandidater: list[dict] | None = None,
     raekker: dict[str, dict] | None = None,
     klub: bool = False,
-    sager: list[str] | None = None,
+    par: list[tuple[str, str]] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -1547,10 +1544,15 @@ def _unresolved_line(
     # granted at the address it was granted at, so a student who has moved
     # SHOULD differ — but it is the one other fact about this student's
     # address that exists, and it is usually the correction.
+    # Which case each student belongs to, so a block listing several students
+    # can be acted on without cross-referencing anything.
+    sag_for_cpr = {cpr: sag for sag, cpr in (par or []) if cpr}
+
     if lois:
         linjer.append("      elev iflg. CPR:")
         linjer.extend(
-            f"                     {cpr}: {tekst or '(kendes ikke i Adresse-tabellen)'}"
+            f"                     {cpr} ({sag_for_cpr.get(cpr, 'ukendt sag')}): "
+            f"{tekst or '(kendes ikke i Adresse-tabellen)'}"
             for cpr, tekst in lois
         )
     elif cprs:
@@ -1754,7 +1756,13 @@ def _resolve_adresse_ids(
 
     # key -> the CPRs whose rows used this address. Only needed for failures,
     # where it is what lets the log say where CPR has that student living.
-    cpr_pr_adresse: dict[tuple[str, ...], set[str]] = {}
+    # (PPR case, CPR) PAIRS, not two separate sets.
+    #
+    # Separate sets lose which case belongs to which student, and the CSV
+    # writer then had to guess by pairing every case with every CPR — three
+    # students sharing an address produced nine rows instead of three, each
+    # child repeated against case ids that were not theirs.
+    par_pr_adresse: dict[tuple[str, ...], set[tuple[str, str]]] = {}
     # Keys belonging to a klub-related row. These are EXPECTED not to resolve
     # and are NOT rejections: the bucket loop puts every klub bevilling on the
     # student's own address, so the failure costs nothing.
@@ -1767,9 +1775,6 @@ def _resolve_adresse_ids(
     # Getting this wrong made the log report "Stensagerskolen" as a rejection
     # when the bevilling had converted perfectly on the student's address.
     klub_keys: set[tuple[str, ...]] = set()
-    # key -> the PPR cases whose rows used this address. Only needed for the
-    # unresolved worklist, where a caseworker needs the case to act on.
-    sag_pr_adresse: dict[tuple[str, ...], set[str]] = {}
     overskrevne = 0
     rettede = 0
 
@@ -1788,18 +1793,14 @@ def _resolve_adresse_ids(
         if _ret_adresse(row.get("ElevensAdresse")) != str(row.get("ElevensAdresse") or ""):
             rettede += 1
 
-        cpr = str(row.get("CPR") or "").strip()
-
-        if cpr:
-            cpr_pr_adresse.setdefault(key, set()).add(cpr)
-
         if _klub_relevant(row):
             klub_keys.add(key)
 
+        cpr = _cpr_cifre(row.get("CPR"))
         sag = str(row.get("CaseID") or "").strip()
 
-        if sag:
-            sag_pr_adresse.setdefault(key, set()).add(sag)
+        if cpr or sag:
+            par_pr_adresse.setdefault(key, set()).add((sag, cpr))
 
     keys = set(kilder)
 
@@ -1963,9 +1964,11 @@ def _resolve_adresse_ids(
             "count": len(candidates),
             "forsoeg": forsoeg,
             "naboer": naboer,
-            "cprs": sorted(cpr_pr_adresse.get(key, set())),
+            # Pairs for the worklist, and the CPRs alone for the LOIS
+            # lookup and the CPR-based fallbacks.
+            "par": sorted(par_pr_adresse.get(key, set())),
+            "cprs": sorted({c for _, c in par_pr_adresse.get(key, set()) if c}),
             "klub": key in klub_keys,
-            "sager": sorted(sag_pr_adresse.get(key, set())),
             # The raw rows, kept so an ambiguity can still be settled below —
             # by CPR, or failing that by their coordinates, which the search
             # returns alongside the text.
