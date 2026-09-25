@@ -504,9 +504,13 @@ The check in `bevilling_creation` stays as a **safety net**: an item queued befo
 
 `process_item` rejects the **whole case** when any bevilling lacks an `adresse_id`. So one unresolvable historic address costs the student their active bevilling as well — data that never arrives, for the sake of a period that ended years ago.
 
-Where a bevilling resolves nothing of its own, it borrows from **another bevilling on the same case** — and only from there, and only when they all agree on one address. Two different ones means the student moved, and picking between them is guessing which era this bevilling belongs to.
+A bevilling borrows only under **two** conditions:
 
-The student's current address from CPR is deliberately **not** a fallback here. Where BefordringsData carries no usable address anywhere on the case, there is nothing to convert from, and placing the bevilling wherever the student lives today would invent a fact the source never stated. Those cases are rejected and land on the worklist.
+**Its rows state no address at all** — the field is empty or NULL. A bevilling whose rows *do* carry an address that merely failed to resolve is bad data, and bad data must be corrected rather than papered over. Borrowing there would hide the very row the worklist exists to surface, so those are still rejected.
+
+**And only from another bevilling on the same case**, when they all agree on one address. Two different ones means the student moved, and picking between them is guessing which era this bevilling belongs to.
+
+The student's current address from CPR is deliberately **not** a fallback here. With nothing written down there is nothing to convert from, and filling it in from CPR would invent a fact the source never stated.
 
 That is what separates this from the klub and closed-case fallbacks, which *do* use CPR: there the source says something, it just cannot be used. Here it says nothing at all.
 

@@ -1222,16 +1222,17 @@ def _byttede_datoer_note(fra: str, til: str, lukket: bool) -> str:
     )
 
 
-def _laant_adresse_note(kilde: str, adresse_tekst: str, hvorfra: str) -> str:
+def _laant_adresse_note(adresse_tekst: str, hvorfra: str) -> str:
     """The comment for a bevilling that borrowed an address it could not resolve."""
 
     return _konverterings_note(
         "adresse lånt fra sagen",
-        f"Kilde: {kilde or '(ingen adresse på rækkerne)'}",
-        "Bevillingens egen adresse kunne ikke slås op i adresseregistret.",
+        "Rækkerne på denne bevilling har ingen adresse i "
+        "foranstaltningsdata — feltet er tomt.",
         f"Brugt i stedet: {adresse_tekst} ({hvorfra}).",
         "Uden en adresse kunne bevillingen slet ikke oprettes, og hele sagen "
-        "ville være afvist. Kontrollér adressen.",
+        "ville være afvist. Kontrollér at det er den rigtige adresse for "
+        "netop denne periode.",
     )
 
 
@@ -2900,6 +2901,12 @@ def retrieve_items_for_queue() -> list[dict]:
                 **bevilling_data,
                 "adresse_id": bevilling_adresse_id,
                 "adresse_id_kandidater": bevilling_adresse_kandidater,
+                # Did ANY row state an address? Not whether one resolved —
+                # whether the source wrote anything down. The two are
+                # different and the borrowing below turns on it.
+                "havde_kildeadresse": any(
+                    str(r.get("ElevensAdresse") or "").strip() for r in bev_rows
+                ),
                 # Every row's school columns, not just the first non-None the
                 # bevilling-level pass picked. Several schools share a
                 # skolekode across two sites, and only these columns say
@@ -2922,17 +2929,25 @@ def retrieve_items_for_queue() -> list[dict]:
         # placed at the wrong address is a note for a caseworker, a rejected
         # case is data that never arrives.
         #
-        # Only from the case's OWN rows. The student's current address from
-        # CPR is deliberately not a fallback here: where BefordringsData
-        # carries no usable address anywhere on the case, there is nothing to
-        # convert from, and putting the bevilling on wherever the student
-        # lives today would invent a fact the source never stated. Those
-        # cases are rejected and land on the worklist instead.
+        # Borrowing, and its two conditions.
+        #
+        # ONLY where the rows state no address at all. A bevilling whose rows
+        # DO carry an address that merely failed to resolve is bad data, and
+        # bad data must be corrected rather than papered over — borrowing
+        # there would hide the very row the worklist exists to surface.
+        #
+        # ONLY from the case's own rows. The student's current address from
+        # CPR is not a fallback here: with nothing written down there is
+        # nothing to convert from, and filling it in from CPR would invent a
+        # fact the source never stated.
         #
         # (CPR remains the fallback for klub rows and closed cases, decided
         # earlier in the bucket loop. Those are different: the source DOES
         # say something, it just cannot be used.)
-        manglende = [b for b in bevillinger if not b.get("adresse_id")]
+        manglende = [
+            b for b in bevillinger
+            if not b.get("adresse_id") and not b.get("havde_kildeadresse")
+        ]
 
         if manglende:
             kendte = {b["adresse_id"] for b in bevillinger if b.get("adresse_id")}
@@ -2952,9 +2967,7 @@ def retrieve_items_for_queue() -> list[dict]:
                     b["adresse_id"] = laant_id
                     b["adresse_id_kandidater"] = [laant_id]
 
-                    note = _laant_adresse_note(
-                        str(b.get("ElevensAdresse") or ""), laant_tekst, hvorfra
-                    )
+                    note = _laant_adresse_note(laant_tekst, hvorfra)
 
                     for k in b["koerselsraekker"]:
                         k["Kommentar"] = _extend_kommentar(k.get("Kommentar"), note)
@@ -3038,10 +3051,12 @@ def retrieve_items_for_queue() -> list[dict]:
 
     if laante_adresser:
         logger.warning(
-            "%d bevilling(er) could not resolve an address of their own and "
-            "borrowed one from another bevilling on the SAME case. Without it "
+            "%d bevilling(er) have NO address at all in the source and "
+            "borrowed one from another bevilling on the same case. Without it "
             "the whole case would have been rejected, active bevillinger "
-            "included. Each says so on its kørselsrækker.\n",
+            "included. A bevilling whose address is merely unresolvable does "
+            "NOT borrow — that is data to correct. Each says so on its "
+            "kørselsrækker.\n",
             laante_adresser,
         )
 
