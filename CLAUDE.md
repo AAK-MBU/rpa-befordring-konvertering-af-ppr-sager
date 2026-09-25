@@ -591,6 +591,27 @@ It refuses whenever the coordinates differ or any is missing. Different points m
 
 The `note` column in `resolved_addresses.csv` carries the comment, so a cached hit does not silently drop the warning.
 
+### The unresolved worklist (`uloeste_adresser.csv`)
+
+Every address the run could not resolve, written out for the caseworkers. Path in `config.UNRESOLVED_ADDRESS_CSV`, `None` switches it off, gitignored.
+
+| column | |
+|---|---|
+| `ppr_sag` | the PPR case to act on |
+| `cpr` | the student |
+| `kilde_adresse` | the address exactly as BefordringsData wrote it |
+| `elev_adresse_iflg_cpr` | where CPR has that student living — usually the correction |
+| `aarsag` | `intet match` / `flertydig — N boliger` / `klubadresse (forventet)` |
+| `registret_har` | the addresses the register does hold nearby |
+
+**One row per case and student behind each address**, because that is the grain someone acts on — an address shared by two cases needs looking at twice. Sorted by case.
+
+**Overwritten every run**, on purpose: it is a snapshot of *this* run's failures, so an address fixed at source disappears from it rather than lingering.
+
+`aarsag` is the column to filter on first. A **klubadresse** is expected not to resolve and its bevilling is created on the student's own address — it is in the file only so the file and the log agree, not because it is work.
+
+Written as `utf-8-sig` so Excel opens `æ/ø/å` correctly; this one is for people rather than for another program.
+
 ### Reading an unresolved address
 
 Each failure logs the source verbatim, every search that ran with what it returned, and — from one extra probe made only on failure — what the register actually holds on that street. The probe runs **only when nothing matched**, and it tries every street spelling the matcher itself tried — not just the source's raw wording. Probing the raw wording alone is how `Borresøvej 041` once reported the neighbours of `Borresøvej 10`: the padded street found nothing, so it fell straight through to the bare street name, where alphabetical order starts at 10, while `borresøvej 41` would have found the building. The bare street name is kept as a last resort, to answer "does this street exist at all".

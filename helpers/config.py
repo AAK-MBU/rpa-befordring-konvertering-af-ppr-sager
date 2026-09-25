@@ -76,3 +76,16 @@ CLOSED_CASES_CSV = "Lukkede foranstaltningsmapper.csv"
 #
 # Missing file means no replacements, which is the behaviour without it.
 ADDRESS_REPLACEMENTS_CSV = "adresse_erstatninger.csv"
+
+
+# --- Unresolved addresses, for the caseworkers -----------------------------
+#
+# Every address the run could not resolve, written out as a worklist:
+# PPR case, CPR, the address as BefordringsData wrote it, and where CPR has
+# that student living.
+#
+# Overwritten on every run, because it is a snapshot of THIS run's failures —
+# an address fixed at source should disappear from it, not linger.
+#
+# Set to None to switch it off.
+UNRESOLVED_ADDRESS_CSV = "uloeste_adresser.csv"

@@ -1307,6 +1307,95 @@ def _upraecis_note(kilde: str, antal: int, valgt: str) -> str:
     )
 
 
+_ULOEST_FELTER = (
+    "ppr_sag",
+    "cpr",
+    "kilde_adresse",
+    "elev_adresse_iflg_cpr",
+    "aarsag",
+    "registret_har",
+)
+
+
+def _skriv_uloeste_csv(
+    unresolved: list[dict],
+    lois_adresse_id: dict[str, str],
+    lois_tekst: dict[str, str],
+) -> None:
+    """Write the unresolved addresses out as a worklist for the caseworkers.
+
+    One row per PPR case and student behind each failing address, because
+    that is the grain someone acts on — an address shared by two cases needs
+    looking at twice.
+
+    Overwritten on every run on purpose: it is a snapshot of THIS run's failures, so
+    an address fixed at source disappears from it rather than lingering.
+
+    aarsag separates the three kinds. A klub address is EXPECTED not to
+    resolve and its bevilling is created on the student's own address, so it
+    is not work — it is in the file only because leaving it out would make
+    the file disagree with the log.
+    """
+
+    navn = getattr(config, "UNRESOLVED_ADDRESS_CSV", None)
+
+    if not navn:
+        return
+
+    path = Path(navn)
+    raekker: list[dict] = []
+
+    for entry in unresolved:
+        if entry.get("klub"):
+            aarsag = "klubadresse (forventet — bevilling oprettes på elevens adresse)"
+        elif entry.get("count"):
+            aarsag = f"flertydig — {entry['count']} boliger passer lige godt"
+        else:
+            aarsag = "intet match i adresseregistret"
+
+        naboer = "; ".join(entry.get("naboer") or [])
+
+        # A case with no CPR, or an address with no case, still gets a row —
+        # a blank cell is visible, a missing row is not.
+        sager = entry.get("sager") or [""]
+        cprs = entry.get("cprs") or [""]
+
+        for sag in sager:
+            for cpr in cprs:
+                adresse_id = lois_adresse_id.get(cpr, "")
+
+                raekker.append({
+                    "ppr_sag": sag,
+                    "cpr": cpr,
+                    "kilde_adresse": entry.get("kilde", ""),
+                    "elev_adresse_iflg_cpr": lois_tekst.get(adresse_id, ""),
+                    "aarsag": aarsag,
+                    "registret_har": naboer,
+                })
+
+    # By case, not by address: the file is worked through a case at a time,
+    # and the resolver's own order is alphabetical by normalised address.
+    raekker.sort(key=lambda r: (r["ppr_sag"], r["cpr"], r["kilde_adresse"]))
+
+    try:
+        # utf-8-sig so Excel opens æ/ø/å correctly — this file is for people,
+        # not for another program.
+        with path.open("w", newline="", encoding="utf-8-sig") as fil:
+            writer = csv.DictWriter(fil, fieldnames=_ULOEST_FELTER)
+            writer.writeheader()
+            writer.writerows(raekker)
+    except OSError as exc:
+        logger.warning("Could not write %s: %s\n", path, exc)
+
+        return
+
+    logger.info(
+        "Wrote %d unresolved address row(s) to %s for manual follow-up.\n",
+        len(raekker),
+        path,
+    )
+
+
 def _unresolved_line(
     key: tuple[str, ...],
     kilde: str,
@@ -1318,6 +1407,7 @@ def _unresolved_line(
     kandidater: list[dict] | None = None,
     raekker: dict[str, dict] | None = None,
     klub: bool = False,
+    sager: list[str] | None = None,
 ) -> str:
     """One block per address that could not be resolved, with enough to act on.
 
@@ -1596,6 +1686,9 @@ def _resolve_adresse_ids(
     # instead. Tracked only so the failure log can say so rather than listing
     # them as problems.
     klub_keys: set[tuple[str, ...]] = set()
+    # key -> the PPR cases whose rows used this address. Only needed for the
+    # unresolved worklist, where a caseworker needs the case to act on.
+    sag_pr_adresse: dict[tuple[str, ...], set[str]] = {}
     overskrevne = 0
     rettede = 0
 
@@ -1621,6 +1714,11 @@ def _resolve_adresse_ids(
 
         if _klub_i_adressen(row):
             klub_keys.add(key)
+
+        sag = str(row.get("CaseID") or "").strip()
+
+        if sag:
+            sag_pr_adresse.setdefault(key, set()).add(sag)
 
     keys = set(kilder)
 
@@ -1786,6 +1884,7 @@ def _resolve_adresse_ids(
             "naboer": naboer,
             "cprs": sorted(cpr_pr_adresse.get(key, set())),
             "klub": key in klub_keys,
+            "sager": sorted(sag_pr_adresse.get(key, set())),
             # The raw rows, kept so an ambiguity can still be settled below —
             # by CPR, or failing that by their coordinates, which the search
             # returns alongside the text.
@@ -1996,6 +2095,8 @@ def _resolve_adresse_ids(
 
     if unresolved:
         klub_antal = sum(1 for e in unresolved if e.get("klub"))
+
+        _skriv_uloeste_csv(unresolved, lois_adresse_id, lois_tekst)
 
         logger.warning(
             "%d address(es) unresolved. %d of them are klub addresses, which "
