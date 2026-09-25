@@ -368,22 +368,47 @@ def _override_adresse(tekst: str | None) -> str | None:
     return None
 
 
-def _skole_kandidater(bev_rows: list[dict]) -> list[list[str]]:
-    """Every distinct (SkolensAdresse, SkoleNavnBefordring) in the bevilling.
+def _skole_kandidater(bev_rows: list[dict]) -> tuple[list[list[str]], bool]:
+    """Every distinct (SkolensAdresse, SkoleNavnBefordring) worth trusting.
 
     Both are bevilling-level columns, so the first non-None wins — and where
-    the first row is a klub row, those columns name the klub rather than the
-    school. A school split across two sites under one skolekode is then
-    impossible to place, even though a sibling row says exactly which site it
-    is.
+    that row is a klub row, those columns describe the klub leg rather than
+    the school. A school split across two sites under one skolekode is then
+    impossible to place, even though a sibling row says exactly which site
+    it is. So every row's pair is passed on, not just the first.
 
-    Passed as a list so bevilling_creation can try them all. Order preserved,
-    duplicates dropped, and rows with neither column left out entirely.
+    KLUB ROWS ARE LEFT OUT where any other row remains. A klub row's school
+    columns describe the other end of a trip to or from the klub, which is
+    not reliably the student's school:
+
+        hjem -> skole    ElevensAdresse Emiliedalsvej 95   SkolensAdresse Janesvej 2
+        skole -> klub    ElevensAdresse Klubben Holme …    SkolensAdresse Stensagervej 11
+
+    Both rows belong to one bevilling at one school, and taken together they
+    name two different sites — enough to fail the whole case. Dropping the
+    klub row leaves Janesvej, which is what the real journey says. Exactly
+    the reasoning that keeps a klub row from supplying the bevilling's
+    address.
+
+    Falls back to every row when they are ALL klub rows: something is better
+    than nothing, and the site then gets the same scrutiny as any other
+    ambiguity.
+
+    Returns (pairs, klub_rows_were_dropped) — the flag so the kørselsrække
+    comment can say where the school came from.
     """
+
+    def uden_klub(row: dict) -> bool:
+        return not _naevner_klub(
+            row.get("ElevensAdresse"), row.get("SkoleNavnBefordring")
+        )
+
+    rene = [r for r in bev_rows if uden_klub(r)]
+    filtreret = bool(rene) and len(rene) != len(bev_rows)
 
     par: list[list[str]] = []
 
-    for row in bev_rows:
+    for row in (rene or bev_rows):
         adresse = str(row.get("SkolensAdresse") or "").strip()
         navn = str(row.get("SkoleNavnBefordring") or "").strip()
 
@@ -393,7 +418,7 @@ def _skole_kandidater(bev_rows: list[dict]) -> list[list[str]]:
         if [adresse, navn] not in par:
             par.append([adresse, navn])
 
-    return par
+    return par, filtreret
 
 
 def _saml_etage_doer(components: list[str]) -> list[str]:
@@ -2356,7 +2381,11 @@ def _klub_relevant(row: dict) -> bool:
     return _naevner_klub(*(row.get(felt) for felt in _KLUB_FELTER))
 
 
-def _klub_note(row: dict, adresse_tekst: str | None) -> str:
+def _klub_note(
+    row: dict,
+    adresse_tekst: str | None,
+    skole_uden_klub: bool = False,
+) -> str:
     """The comment left on every kørselsrække of a klub-related bevilling.
 
     The old system had no klub kørsel. To record it anyway, caseworkers wrote
@@ -2379,12 +2408,25 @@ def _klub_note(row: dict, adresse_tekst: str | None) -> str:
         for felt in _KLUB_FELTER
     ]
 
+    skolelinje = (
+        [
+            (
+                "Skolen er valgt ud fra de rækker, der IKKE vedrører "
+                "klubben — en klubrækkes skolekolonner beskriver den anden "
+                "ende af klubturen."
+            )
+        ]
+        if skole_uden_klub
+        else []
+    )
+
     return _konverterings_note(
         "klub kan indgå i befordringen",
         "Kilde (denne kørselsrække):",
         *[f"  {linje}" for linje in linjer],
         f"Bevillingen er oprettet på elevens egen adresse: "
         f"{adresse_tekst or '(ukendt)'}",
+        *skolelinje,
         "Det gamle system havde ikke klubkørsel, så klubben er skrevet ind i "
         "felterne ovenfor. Ret bevillingen manuelt, så den afspejler den "
         "faktiske befordring.",
@@ -2657,6 +2699,7 @@ def retrieve_items_for_queue() -> list[dict]:
             # comment. The bevilling then goes on the STUDENT'S address and
             # every kørselsrække says the befordring needs rebuilding.
             klub_bevilling = any(_klub_relevant(r) for r in bev_rows)
+            skole_par, skole_uden_klub = _skole_kandidater(bev_rows)
 
             lukket_id = None
             lukket_note = None
@@ -2833,7 +2876,8 @@ def retrieve_items_for_queue() -> list[dict]:
 
                 for koersel, row in zip(koerselsraekker, bev_rows):
                     koersel["Kommentar"] = _extend_kommentar(
-                        koersel.get("Kommentar"), _klub_note(row, klub_tekst)
+                        koersel.get("Kommentar"),
+                        _klub_note(row, klub_tekst, skole_uden_klub),
                     )
                     klub_rows += 1
 
@@ -2878,7 +2922,7 @@ def retrieve_items_for_queue() -> list[dict]:
                 # skolekode across two sites, and only these columns say
                 # which — so a bevilling whose first row happens to name a
                 # klub there must still be able to fall back on its siblings.
-                "skole_kandidater": _skole_kandidater(bev_rows),
+                "skole_kandidater": skole_par,
                 "bucket": bev_key[0],
                 "foerste_koersel_dato": foerste_koersel_dato,
                 "sagsbehandlingsdato": sagsbehandlingsdato,

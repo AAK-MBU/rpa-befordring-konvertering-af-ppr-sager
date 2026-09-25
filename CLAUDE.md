@@ -82,7 +82,16 @@ Vestergårdsskolen (Stensagervej)    751050
 
 `SkoleID` alone therefore does **not** identify a matrikel. `_vaelg_matrikel` tells the sites apart on the street in `SkolensAdresse`, matched against the site name the lookup label carries in parentheses — `Stensagervej 11` against `Stensagerskolen (Stensagervej)`. Compared through `_uden_accent`: case and spacing ignored, accents folded, and `æ/ø/å` flattened to `ae/oe/aa`. All three are needed — the source writes `Grønløkke Alle` for the seeded `Grønløkke Allé`, and `Groenloekke` as readily as `Grønløkke`. Verified that no pair of sites sharing a skolekode collapses onto the other under that fold. `SkoleNavnBefordring` is tried too, because the source sometimes names the site there instead: `Stensagerskolen (afd. Stensagervej)`.
 
-**Every row's pair is tried, not just the bevilling's first non-None.** `SkolensAdresse` and `SkoleNavnBefordring` are bevilling-level columns, so where the first row is a klub row they name the *klub* — `Nygårdsvej 5, 8270 Højbjerg` — and the site is unfindable even though a sibling row states it plainly. `_skole_kandidater` collects every distinct pair in the bevilling and passes them all.
+**Klub rows do not decide the school.** A klub row's school columns describe the other end of a trip to or from the klub, not the student's school:
+
+```
+hjem → skole    ElevensAdresse Emiliedalsvej 95   SkolensAdresse Janesvej 2
+skole → klub    ElevensAdresse Klubben Holme …    SkolensAdresse Stensagervej 11
+```
+
+Both rows belong to one bevilling at one school, and taken together they name **two different sites** — enough to fail the whole case. `_skole_kandidater` drops the klub rows where any other row remains, leaving `Janesvej`, which is what the real journey says. The same reasoning that keeps a klub row from supplying the bevilling's address, and the klub comment on the kørselsrækker says the school was chosen that way. Falls back to every row when they are all klub rows.
+
+**Every remaining row's pair is tried, not just the bevilling's first non-None.** `SkolensAdresse` and `SkoleNavnBefordring` are bevilling-level columns, so where the first row is a klub row they name the *klub* — `Nygårdsvej 5, 8270 Højbjerg` — and the site is unfindable even though a sibling row states it plainly. `_skole_kandidater` collects every distinct pair in the bevilling and passes them all.
 
 The rows must **agree**. One matrikel across all of them is the answer; two different ones is a real disagreement — some rows to Janesvej, some to Stensagervej — and that is a case for a human, not a coin toss. The error names both the pairs tried and the sites they pointed at.
 
