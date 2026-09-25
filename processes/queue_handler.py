@@ -19,7 +19,11 @@ from mbu_rpa_core.database.connection import RPAConnection
 from mbu_rpa_core.exceptions import ProcessError
 
 from helpers import config
-from processes.bevilling_creation import get_api_credentials
+from processes.bevilling_creation import (
+    _extend_kommentar,
+    _konverterings_note,
+    get_api_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -962,33 +966,6 @@ def _vaelg_via_cpr_uden_match(
     adresse_id = valgte.pop()
 
     return adresse_id, raekker[adresse_id].get("adresse_tekst") or ""
-
-
-# Every comment this conversion writes begins with this exact string, and
-# nothing else in the application writes it. It is what makes the converted
-# rows findable afterwards:
-#
-#     SELECT DISTINCT b.bevilling_id
-#     FROM   befordring.Koersel k
-#     JOIN   befordring.Bevilling b ON b.bevilling_id = k.bevilling_id
-#     WHERE  k.kommentar LIKE '%KONVERTERING-PPR%';
-#
-# No square brackets, percent signs or underscores on purpose: all three are
-# metacharacters in T-SQL LIKE, and a marker containing them would silently
-# match far more than intended.
-_KONVERTERING_MARKOER = "KONVERTERING-PPR"
-
-
-def _konverterings_note(emne: str, *linjer: str) -> str:
-    """One comment from the conversion, marked so it can be found again.
-
-    Every note goes through here, so the marker cannot be forgotten on a new
-    one, and the second field names the KIND of note — a caseworker scanning
-    the list can tell a punctuation match from an assumed flat without
-    reading the body.
-    """
-
-    return "\n".join([f"{_KONVERTERING_MARKOER} | {emne}", *linjer])
 
 
 def _cpr_korrektion_note(kilde: str, valgt: str) -> str:
@@ -2412,17 +2389,6 @@ def _klub_note(row: dict, adresse_tekst: str | None) -> str:
         "felterne ovenfor. Ret bevillingen manuelt, så den afspejler den "
         "faktiske befordring.",
     )
-
-
-def _extend_kommentar(kommentar: str | None, note: str | None) -> str | None:
-    """Append a note to a comment, keeping whichever of the two exists."""
-
-    existing = str(kommentar or "").strip()
-
-    if not note:
-        return existing or None
-
-    return f"{existing}\n\n{note}" if existing else note
 
 
 def _one_month_on(day: date) -> date:

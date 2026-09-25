@@ -81,10 +81,22 @@ def _uden_accent(value: str | None) -> str:
     return "".join(c for c in nedbrudt if not unicodedata.combining(c))
 
 
+def _extend_kommentar(kommentar: str | None, note: str | None) -> str | None:
+    """Append a note to a comment, keeping whichever of the two exists."""
+
+    eksisterende = str(kommentar or "").strip()
+
+    if not note:
+        return eksisterende or None
+
+    return f"{eksisterende}\n\n{note}" if eksisterende else note
+
+
 def _vaelg_matrikel(
     kandidater: list[dict],
     skole_par: list,
-) -> int | None:
+    bucket: str | None = None,
+) -> tuple[int | None, str | None]:
     """Which matrikel a bevilling belongs to, when a skolekode has several.
 
     Some schools run on two sites under one skolekode:
@@ -110,16 +122,27 @@ def _vaelg_matrikel(
     different ones is a real disagreement — some rows to Janesvej, some to
     Stensagervej — and that is a case for a human, not a coin toss.
 
-    Returns None when the code is unknown, exactly as before. Raises when the
-    code is known but the site cannot be settled: a wrong school is worse
-    than a stopped case.
+    On a bucket of "past" an unsettled site is GUESSED rather than raised.
+    That bevilling has expired: it is not routing anyone, its walking
+    distance is not being recalculated, and the only cost of the wrong site
+    is a field a caseworker may correct. Against that, raising loses the
+    whole case — the student's active bevilling included. The guess is the
+    first site by name, so it is stable across runs, and the kørselsrækker
+    say plainly that it was a guess and what the source actually held.
+
+    Anywhere else — current, future, ukendt — it still raises. Those are live
+    bevillinger, and a wrong school there drives the walking distance, the
+    skolekode comparison and the school derivation on Elev.
+
+    Returns (matrikel_id, note). The note is None unless a guess was made.
+    An unknown skolekode yields (None, None), exactly as before.
     """
 
     if not kandidater:
-        return None
+        return None, None
 
     if len(kandidater) == 1:
-        return kandidater[0]["id"]
+        return kandidater[0]["id"], None
 
     fundet: dict[int, str] = {}
 
@@ -134,12 +157,29 @@ def _vaelg_matrikel(
                 fundet[k["id"]] = str(k.get("label"))
 
     if len(fundet) == 1:
-        return next(iter(fundet))
+        return next(iter(fundet)), None
 
     proevet = "; ".join(
         f"{(list(p) + ['', ''])[0]!r} / {(list(p) + ['', ''])[1]!r}"
         for p in skole_par or []
     ) or "(ingen skolekolonner på rækkerne)"
+
+    # An expired bevilling is guessed rather than lost. See the docstring.
+    if str(bucket or "").strip().casefold() == "past":
+        valgt = min(kandidater, key=lambda k: str(k.get("label") or ""))
+
+        note = _konverterings_note(
+            "skoleafdeling gættet",
+            f"Skolekode {kandidater[0].get('skolekode')} dækker flere "
+            f"afdelinger: {', '.join(str(k.get('label')) for k in kandidater)}.",
+            f"Rækkernes SkolensAdresse / SkoleNavnBefordring: {proevet}",
+            "Ingen af dem peger entydigt på en afdeling.",
+            f"Valgt: {valgt.get('label')}",
+            "Bevillingen er udløbet, så afdelingen har ingen praktisk "
+            "betydning — men ret den, hvis den skal være rigtig.",
+        )
+
+        return valgt["id"], note
 
     raise BusinessError(
         f"Skolekode {kandidater[0].get('skolekode')} har "
@@ -155,6 +195,33 @@ def _vaelg_matrikel(
         + " Kan ikke afgøre hvilken afdeling bevillingen hører til — "
         "kræver manuel opfølgning."
     )
+
+
+# Every comment this conversion writes begins with this exact string, and
+# nothing else in the application writes it. It is what makes the converted
+# rows findable afterwards:
+#
+#     SELECT DISTINCT b.bevilling_id
+#     FROM   befordring.Koersel k
+#     JOIN   befordring.Bevilling b ON b.bevilling_id = k.bevilling_id
+#     WHERE  k.kommentar LIKE '%KONVERTERING-PPR%';
+#
+# No square brackets, percent signs or underscores on purpose: all three are
+# metacharacters in T-SQL LIKE, and a marker containing them would silently
+# match far more than intended.
+_KONVERTERING_MARKOER = "KONVERTERING-PPR"
+
+
+def _konverterings_note(emne: str, *linjer: str) -> str:
+    """One comment from the conversion, marked so it can be found again.
+
+    Every note goes through here, so the marker cannot be forgotten on a new
+    one, and the second field names the KIND of note — a caseworker scanning
+    the list can tell a punctuation match from an assumed flat without
+    reading the body.
+    """
+
+    return "\n".join([f"{_KONVERTERING_MARKOER} | {emne}", *linjer])
 
 
 def _normalise(value: str | None) -> str:
@@ -705,13 +772,22 @@ def create_bevilling(
         # --- Resolve bevilling-level lookup IDs ---
         skole_id = str(bevilling.get("SkoleID") or "").strip()
         matrikel_kandidater = skolematrikel_map.get(skole_id, [])
-        matrikel_id = _vaelg_matrikel(
+        matrikel_id, matrikel_note = _vaelg_matrikel(
             matrikel_kandidater,
             bevilling.get("skole_kandidater")
             # Older queue items predate skole_kandidater; fall back to the
             # bevilling-level pair so they still convert.
             or [[bevilling.get("SkolensAdresse"), bevilling.get("SkoleNavnBefordring")]],
+            bevilling.get("bucket"),
         )
+
+        if matrikel_note:
+            logger.warning(
+                "  Skolekode %s: afdelingen kunne ikke afgøres, og "
+                "bevillingen er udløbet — gættet. Kørselsrækkerne får en "
+                "kommentar.\n",
+                skole_id,
+            )
 
         if len(matrikel_kandidater) > 1:
             logger.info(
@@ -838,7 +914,7 @@ def create_bevilling(
                 "befordringstype_id": befordringstype_id,
                 "rutetype_id": rutetype_id,
                 "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
-                "kommentar": kr.get("Kommentar") or None,
+                "kommentar": _extend_kommentar(kr.get("Kommentar"), matrikel_note),
                 "dag_ids": [alle_dage_id],
                 "tillaeg_ids": tillaeg_ids,
             }

@@ -86,7 +86,12 @@ Vestergårdsskolen (Stensagervej)    751050
 
 The rows must **agree**. One matrikel across all of them is the answer; two different ones is a real disagreement — some rows to Janesvej, some to Stensagervej — and that is a case for a human, not a coin toss. The error names both the pairs tried and the sites they pointed at.
 
-An unknown skolekode still yields no matrikel, exactly as before. A known one whose site cannot be settled **raises** and the case goes to `pending_user` — a wrong school is worse than a stopped case.
+An unknown skolekode still yields no matrikel, exactly as before.
+
+A known one whose site cannot be settled depends on the bucket:
+
+- **`past`** — the site is **guessed** (first by name, so it is stable across runs) and the kørselsrækker get a `skoleafdeling gættet` comment carrying the source columns, the sites and the choice. That bevilling has expired: it routes nobody, its walking distance is not recalculated, and the only cost is a field someone may correct. Raising instead would lose the whole case, the student's *active* bevilling included.
+- **anything else** — still raises, and the case goes to `pending_user`. Those are live bevillinger, where the school drives the walking distance, the skolekode comparison and the school derivation on `Elev`.
 
 This was a live bug: `skolematrikel_map` was a dict keyed on skolekode, so the last entry won, and the lookup is ordered by `matrikel_navn`. Every `751903` student was being given `Stensagervej`, including the ones at `Janesvej`.
 
