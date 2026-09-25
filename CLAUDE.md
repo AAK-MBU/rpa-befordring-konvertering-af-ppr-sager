@@ -624,6 +624,8 @@ python -m helpers.tjek_elever --limit 50   # a quick sample
 
 Standalone, not part of the conversion. Writes nothing anywhere and calls no mutating endpoint. Run it **before** a conversion so the gaps are known up front rather than discovered one failed case at a time.
 
+It reads BefordringsData over **the same two-year window the conversion does** (`BevillingFra` and `BevillingTil` within the last two years). The two queries must be changed together — a report covering rows the conversion never reads would list students nobody is going to convert.
+
 For every distinct CPR in `BefordringsData` it answers two independent questions:
 
 | | source | what a miss means |

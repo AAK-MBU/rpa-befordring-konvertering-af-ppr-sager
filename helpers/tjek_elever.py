@@ -7,7 +7,9 @@ endpoint — it reads three sources and reports where they disagree, so the
 gaps are known BEFORE a conversion rather than discovered one failed case at
 a time.
 
-For every distinct CPR in BefordringsData it answers two questions:
+For every distinct CPR in BefordringsData — over the same two-year window
+the conversion reads, so the two agree on which students are in scope — it
+answers two questions:
 
     in Elev?    The Elev table in Befordringssystemet, read directly where
                 DBCONNECTIONSTRINGBEFORDRING is set — two chunked queries
@@ -71,6 +73,11 @@ def _cpr_cifre(cpr) -> str:
 def _hent_cprs() -> tuple[dict[str, int], dict[str, set[str]], int]:
     """Distinct CPRs in BefordringsData, with row counts and PPR cases.
 
+    Limited to the last two years of bevilling dates, matching the
+    conversion's own query. Note that this also drops rows with NULL dates,
+    since NULL compares as unknown — the same rows the conversion no longer
+    sees either.
+
     Also returns how many rows carried no usable CPR at all: those can never
     be converted, and they are invisible in a per-CPR report.
     """
@@ -80,8 +87,19 @@ def _hent_cprs() -> tuple[dict[str, int], dict[str, set[str]], int]:
 
     with pyodbc.connect(conn_string) as conn:
         cursor = conn.cursor()
+
+        # The SAME window the conversion uses — see the query in
+        # processes/queue_handler.py. A report over rows the conversion will
+        # never read would list students nobody is going to convert, and the
+        # two must be changed together or this stops answering the question
+        # it is asked.
         cursor.execute(
-            "SELECT [CPR], [CaseID] FROM [RPA].[rpa].[BefordringsData]"
+            """
+            SELECT [CPR], [CaseID]
+            FROM   [RPA].[rpa].[BefordringsData]
+            WHERE  [BevillingFra] >= DATEADD(YEAR, -2, GETDATE()) AND
+                   [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
+            """
         )
         rows = cursor.fetchall()
 
