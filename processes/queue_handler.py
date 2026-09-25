@@ -2235,7 +2235,7 @@ def _resolve_adresse_ids(
             "\n".join(_unresolved_line(**entry) for entry in unresolved),
         )
 
-    raise SystemExit("Manual stop")
+    # raise SystemExit("Manual stop")
 
     return resolved, tekster, adresse_noter
 
@@ -2590,11 +2590,14 @@ def retrieve_items_for_queue() -> list[dict]:
     behov = {
         _cpr_cifre(row.get("CPR"))
         for row in rows
-        # Any row without a usable address, whatever the reason. A closed
-        # case and a klub row are the obvious ones, but an ordinary open case
-        # with one unresolvable historic address needs a reserve just as
-        # much — without it the whole case is rejected.
-        if _uden_adresse(row) or _klub_relevant(row)
+        # Closed cases and klub rows only. Those are the two places the
+        # source says something that cannot be used, and where the student's
+        # own address is the right substitute. An ordinary unresolvable
+        # address is NOT — see the borrowing further down.
+        if (
+            (str(row.get("CaseID") or "").strip() in lukkede_sager and _uden_adresse(row))
+            or _klub_relevant(row)
+        )
     }
 
     behov.discard("")
@@ -2610,8 +2613,8 @@ def retrieve_items_for_queue() -> list[dict]:
                 elev_adresse[cpr] = (adresse_id, tekst)
 
         logger.info(
-            "%d student(s) may need their own address from LOIS (a row with "
-            "no match, or a klub row); %d of them could be resolved.\n",
+            "%d student(s) may need their own address from LOIS (closed case "
+            "with no match, or a klub row); %d of them could be resolved.\n",
             len(behov),
             len(elev_adresse),
         )
@@ -2919,32 +2922,31 @@ def retrieve_items_for_queue() -> list[dict]:
         # placed at the wrong address is a note for a caseworker, a rejected
         # case is data that never arrives.
         #
-        # Preference is the case's own address before the student's current
-        # one — the siblings are from the same case and the same period, so
-        # they are the closer guess. Both are recorded in the comment.
+        # Only from the case's OWN rows. The student's current address from
+        # CPR is deliberately not a fallback here: where BefordringsData
+        # carries no usable address anywhere on the case, there is nothing to
+        # convert from, and putting the bevilling on wherever the student
+        # lives today would invent a fact the source never stated. Those
+        # cases are rejected and land on the worklist instead.
+        #
+        # (CPR remains the fallback for klub rows and closed cases, decided
+        # earlier in the bucket loop. Those are different: the source DOES
+        # say something, it just cannot be used.)
         manglende = [b for b in bevillinger if not b.get("adresse_id")]
 
         if manglende:
             kendte = {b["adresse_id"] for b in bevillinger if b.get("adresse_id")}
-            reserve = elev_adresse.get(_cpr_cifre(person_ssn))
-            laant_id = hvorfra = None
+            laant_id = None
 
             # Only when the siblings AGREE. Two different addresses means the
             # student moved, and picking one of them is guessing at which era
             # this bevilling belongs to.
             if len(kendte) == 1:
                 laant_id = next(iter(kendte))
-                hvorfra = "samme sags øvrige bevillinger"
-            elif reserve:
-                laant_id, _ = reserve
-                hvorfra = "elevens nuværende adresse iflg. CPR"
 
             if laant_id:
-                laant_tekst = (
-                    adresse_tekster.get(laant_id)
-                    or (reserve[1] if reserve else "")
-                    or laant_id
-                )
+                laant_tekst = adresse_tekster.get(laant_id) or laant_id
+                hvorfra = "samme sags øvrige bevillinger"
 
                 for b in manglende:
                     b["adresse_id"] = laant_id
@@ -3037,10 +3039,9 @@ def retrieve_items_for_queue() -> list[dict]:
     if laante_adresser:
         logger.warning(
             "%d bevilling(er) could not resolve an address of their own and "
-            "borrowed one — from another bevilling on the same case, or the "
-            "student's current address. Without it the whole case would have "
-            "been rejected, active bevillinger included. Each says so on its "
-            "kørselsrækker.\n",
+            "borrowed one from another bevilling on the SAME case. Without it "
+            "the whole case would have been rejected, active bevillinger "
+            "included. Each says so on its kørselsrækker.\n",
             laante_adresser,
         )
 

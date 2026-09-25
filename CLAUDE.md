@@ -504,13 +504,13 @@ The check in `bevilling_creation` stays as a **safety net**: an item queued befo
 
 `process_item` rejects the **whole case** when any bevilling lacks an `adresse_id`. So one unresolvable historic address costs the student their active bevilling as well — data that never arrives, for the sake of a period that ended years ago.
 
-Where a bevilling resolves nothing of its own, it borrows:
+Where a bevilling resolves nothing of its own, it borrows from **another bevilling on the same case** — and only from there, and only when they all agree on one address. Two different ones means the student moved, and picking between them is guessing which era this bevilling belongs to.
 
-1. **another bevilling on the same case**, but only when they all agree on one address. Two different ones means the student moved, and picking between them is guessing which era this bevilling belongs to.
-2. failing that, the **student's current address** from LOIS.
-3. failing both, the case is rejected as before.
+The student's current address from CPR is deliberately **not** a fallback here. Where BefordringsData carries no usable address anywhere on the case, there is nothing to convert from, and placing the bevilling wherever the student lives today would invent a fact the source never stated. Those cases are rejected and land on the worklist.
 
-Siblings come first because they are from the same case and the same period, so they are the closer guess. Every borrowed address leaves a comment on all the bevilling's kørselsrækker, naming where it came from:
+That is what separates this from the klub and closed-case fallbacks, which *do* use CPR: there the source says something, it just cannot be used. Here it says nothing at all.
+
+The borrowed address leaves a comment on all the bevilling's kørselsrækker:
 
 ```
 KONVERTERING-PPR | adresse lånt fra sagen
@@ -521,7 +521,7 @@ Uden en adresse kunne bevillingen slet ikke oprettes, og hele sagen ville
 være afvist. Kontrollér adressen.
 ```
 
-The LOIS reserve is now looked up for **any** row without a usable address, not only klub rows and closed cases — an ordinary open case with one bad historic address needs it just as much.
+
 
 ### Closed PPR cases
 
