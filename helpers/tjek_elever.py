@@ -73,10 +73,9 @@ def _cpr_cifre(cpr) -> str:
 def _hent_cprs() -> tuple[dict[str, int], dict[str, set[str]], int]:
     """Distinct CPRs in BefordringsData, with row counts and PPR cases.
 
-    Limited to the last two years of bevilling dates, matching the
-    conversion's own query. Note that this also drops rows with NULL dates,
-    since NULL compares as unknown — the same rows the conversion no longer
-    sees either.
+    Scoped the same way the conversion is: every row for any student who has
+    at least one bevilling inside the last two years, and nothing at all for
+    a student whose every row is older. The two queries must stay in step.
 
     Also returns how many rows carried no usable CPR at all: those can never
     be converted, and they are invisible in a per-CPR report.
@@ -97,8 +96,12 @@ def _hent_cprs() -> tuple[dict[str, int], dict[str, set[str]], int]:
             """
             SELECT [CPR], [CaseID]
             FROM   [RPA].[rpa].[BefordringsData]
-            WHERE  [BevillingFra] >= DATEADD(YEAR, -2, GETDATE()) AND
-                   [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
+            WHERE  [CPR] IN (
+                       SELECT [CPR]
+                       FROM   [RPA].[rpa].[BefordringsData]
+                       WHERE  [BevillingFra] >= DATEADD(YEAR, -2, GETDATE())
+                          OR  [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
+                   )
             """
         )
         rows = cursor.fetchall()

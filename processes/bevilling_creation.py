@@ -6,6 +6,7 @@ befordring application via its REST API.
 import logging
 import os
 import re
+import unicodedata
 
 from datetime import date
 
@@ -46,6 +47,40 @@ def _fetch_lookup(api_endpoint: str, api_key: str, path: str) -> list[dict]:
 _MATRIKEL_STED = re.compile(r"\(([^)]+)\)")
 
 
+def _uden_accent(value: str | None) -> str:
+    """_normalise, with accents folded away as well.
+
+    The source writes the site without its accent:
+
+        Skolematrikel     Tranbjergskolen (Grønløkke Allé)
+        SkolensAdresse    Grønløkke Alle
+
+    "allé" and "alle" are one street written two ways, and comparing them as
+    they stand leaves a bevilling unplaceable for the sake of one character.
+
+    æ/ø/å are flattened to ae/oe/aa for the same reason — the source writes
+    "Groenloekke" as readily as "Grønløkke" — matching how _fold treats klub
+    markers and addresses elsewhere.
+
+    NFD splits a letter from its accent and the combining marks are dropped,
+    which takes care of é and of the å that ae/oe/aa flattening leaves.
+
+    Verified against all ten seeded site names: no pair of sites sharing a
+    skolekode collapses onto the other under this fold, so nothing becomes
+    ambiguous that was not already. Both sides are folded identically in any
+    case, so a fold can only ever make two spellings of one name agree.
+    """
+
+    foldet = _normalise(value)
+
+    for saerlig, almindelig in (("æ", "ae"), ("ø", "oe"), ("å", "aa")):
+        foldet = foldet.replace(saerlig, almindelig)
+
+    nedbrudt = unicodedata.normalize("NFD", foldet)
+
+    return "".join(c for c in nedbrudt if not unicodedata.combining(c))
+
+
 def _vaelg_matrikel(
     kandidater: list[dict],
     skole_par: list,
@@ -61,8 +96,10 @@ def _vaelg_matrikel(
     carries SkolensAdresse — "Janesvej 2", "Stensagervej 11" — so the street
     in the address is what tells them apart. Matched on the normalised forms,
     so spacing and case do not matter and "Bøgeskov Høvej" finds "Bøgeskov
-    Høvej 10". SkoleNavnBefordring is tried too, because the source sometimes
-    names the site there instead: "Stensagerskolen (afd. Stensagervej)".
+    Høvej 10". Accents are folded too, because the source drops them:
+    "Grønløkke Alle" has to find "Tranbjergskolen (Grønløkke Allé)".
+    SkoleNavnBefordring is tried as well, because the source sometimes names
+    the site there instead: "Stensagerskolen (afd. Stensagervej)".
 
     EVERY row's pair is tried, not just the bevilling's first non-None.
     Those two columns are bevilling-level, so where the first row is a klub
@@ -88,12 +125,12 @@ def _vaelg_matrikel(
 
     for par in skole_par or []:
         adresse, navn = (list(par) + ["", ""])[:2]
-        haystack = _normalise(adresse) + "\x00" + _normalise(navn)
+        haystack = _uden_accent(adresse) + "\x00" + _uden_accent(navn)
 
         for k in kandidater:
             sted = _MATRIKEL_STED.search(str(k.get("label") or ""))
 
-            if sted and _normalise(sted.group(1)) in haystack:
+            if sted and _uden_accent(sted.group(1)) in haystack:
                 fundet[k["id"]] = str(k.get("label"))
 
     if len(fundet) == 1:

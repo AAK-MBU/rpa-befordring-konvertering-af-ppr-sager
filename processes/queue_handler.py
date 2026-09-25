@@ -2518,9 +2518,23 @@ def retrieve_items_for_queue() -> list[dict]:
             [HjemmelForBevilling], [TidspunktForBevilling],
             [BevillingAfKoerselstype], [Kommentar]
         FROM [RPA].[rpa].[BefordringsData]
-        WHERE
-            [BevillingFra] >= DATEADD(YEAR, -2, GETDATE()) AND
-            [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
+        -- Scope: the whole student, not the individual row.
+        --
+        -- A student with ANY bevilling inside the last two years is converted
+        -- in full, older rows included — those are their history, and a
+        -- bevilling list missing its earlier entries is worse than one that
+        -- reaches further back than needed. A student whose every row is
+        -- older than that is left out entirely.
+        --
+        -- OR, not AND, on the two dates: a bevilling running 2023-08-01 to
+        -- 2027-06-30 is active TODAY, and requiring both dates to be recent
+        -- would drop it for having started too long ago.
+        WHERE [CPR] IN (
+            SELECT [CPR]
+            FROM   [RPA].[rpa].[BefordringsData]
+            WHERE  [BevillingFra] >= DATEADD(YEAR, -2, GETDATE())
+               OR  [BevillingTil] >= DATEADD(YEAR, -2, GETDATE())
+        )
         ORDER BY [CaseID] DESC
     """
 

@@ -80,7 +80,7 @@ Vestergårdsskolen (Nordbyvej)       751050
 Vestergårdsskolen (Stensagervej)    751050
 ```
 
-`SkoleID` alone therefore does **not** identify a matrikel. `_vaelg_matrikel` tells the sites apart on the street in `SkolensAdresse`, matched against the site name the lookup label carries in parentheses — `Stensagervej 11` against `Stensagerskolen (Stensagervej)`. Compared through `_normalise`, so spacing and case do not matter and `Bøgeskov Høvej` finds `Bøgeskov Høvej 10`. `SkoleNavnBefordring` is tried too, because the source sometimes names the site there instead: `Stensagerskolen (afd. Stensagervej)`.
+`SkoleID` alone therefore does **not** identify a matrikel. `_vaelg_matrikel` tells the sites apart on the street in `SkolensAdresse`, matched against the site name the lookup label carries in parentheses — `Stensagervej 11` against `Stensagerskolen (Stensagervej)`. Compared through `_uden_accent`: case and spacing ignored, accents folded, and `æ/ø/å` flattened to `ae/oe/aa`. All three are needed — the source writes `Grønløkke Alle` for the seeded `Grønløkke Allé`, and `Groenloekke` as readily as `Grønløkke`. Verified that no pair of sites sharing a skolekode collapses onto the other under that fold. `SkoleNavnBefordring` is tried too, because the source sometimes names the site there instead: `Stensagerskolen (afd. Stensagervej)`.
 
 **Every row's pair is tried, not just the bevilling's first non-None.** `SkolensAdresse` and `SkoleNavnBefordring` are bevilling-level columns, so where the first row is a klub row they name the *klub* — `Nygårdsvej 5, 8270 Højbjerg` — and the site is unfindable even though a sibling row states it plainly. `_skole_kandidater` collects every distinct pair in the bevilling and passes them all.
 
