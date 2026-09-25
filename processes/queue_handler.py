@@ -1222,6 +1222,19 @@ def _byttede_datoer_note(fra: str, til: str, lukket: bool) -> str:
     )
 
 
+def _laant_adresse_note(kilde: str, adresse_tekst: str, hvorfra: str) -> str:
+    """The comment for a bevilling that borrowed an address it could not resolve."""
+
+    return _konverterings_note(
+        "adresse lånt fra sagen",
+        f"Kilde: {kilde or '(ingen adresse på rækkerne)'}",
+        "Bevillingens egen adresse kunne ikke slås op i adresseregistret.",
+        f"Brugt i stedet: {adresse_tekst} ({hvorfra}).",
+        "Uden en adresse kunne bevillingen slet ikke oprettes, og hele sagen "
+        "ville være afvist. Kontrollér adressen.",
+    )
+
+
 def _lukket_sag_note(kilde: str, adresse_tekst: str) -> str:
     """The comment left on a closed case converted onto the student's address."""
 
@@ -2577,10 +2590,11 @@ def retrieve_items_for_queue() -> list[dict]:
     behov = {
         _cpr_cifre(row.get("CPR"))
         for row in rows
-        if (
-            (str(row.get("CaseID") or "").strip() in lukkede_sager and _uden_adresse(row))
-            or _klub_relevant(row)
-        )
+        # Any row without a usable address, whatever the reason. A closed
+        # case and a klub row are the obvious ones, but an ordinary open case
+        # with one unresolvable historic address needs a reserve just as
+        # much — without it the whole case is rejected.
+        if _uden_adresse(row) or _klub_relevant(row)
     }
 
     behov.discard("")
@@ -2596,8 +2610,8 @@ def retrieve_items_for_queue() -> list[dict]:
                 elev_adresse[cpr] = (adresse_id, tekst)
 
         logger.info(
-            "%d student(s) may need their own address from LOIS (closed case "
-            "with no match, or a klub row); %d of them could be resolved.\n",
+            "%d student(s) may need their own address from LOIS (a row with "
+            "no match, or a klub row); %d of them could be resolved.\n",
             len(behov),
             len(elev_adresse),
         )
@@ -2628,6 +2642,7 @@ def retrieve_items_for_queue() -> list[dict]:
     klub_rows = 0
     klub_bevillinger = 0
     byttede_datoer = 0
+    laante_adresser = 0
     hjaelpemiddel_rows = 0
     byttede_datoer_aabne = 0
     omvendte_datoer: set[str] = set()
@@ -2896,6 +2911,54 @@ def retrieve_items_for_queue() -> list[dict]:
 
             adresse_log.append((bev_key[0], adresse_opslag))
 
+        # A bevilling whose own address would not resolve borrows one.
+        #
+        # process_item rejects the WHOLE case if any bevilling lacks an
+        # address, so one bad historic address costs the student their active
+        # bevilling too. That trade is not worth making: an expired bevilling
+        # placed at the wrong address is a note for a caseworker, a rejected
+        # case is data that never arrives.
+        #
+        # Preference is the case's own address before the student's current
+        # one — the siblings are from the same case and the same period, so
+        # they are the closer guess. Both are recorded in the comment.
+        manglende = [b for b in bevillinger if not b.get("adresse_id")]
+
+        if manglende:
+            kendte = {b["adresse_id"] for b in bevillinger if b.get("adresse_id")}
+            reserve = elev_adresse.get(_cpr_cifre(person_ssn))
+            laant_id = hvorfra = None
+
+            # Only when the siblings AGREE. Two different addresses means the
+            # student moved, and picking one of them is guessing at which era
+            # this bevilling belongs to.
+            if len(kendte) == 1:
+                laant_id = next(iter(kendte))
+                hvorfra = "samme sags øvrige bevillinger"
+            elif reserve:
+                laant_id, _ = reserve
+                hvorfra = "elevens nuværende adresse iflg. CPR"
+
+            if laant_id:
+                laant_tekst = (
+                    adresse_tekster.get(laant_id)
+                    or (reserve[1] if reserve else "")
+                    or laant_id
+                )
+
+                for b in manglende:
+                    b["adresse_id"] = laant_id
+                    b["adresse_id_kandidater"] = [laant_id]
+
+                    note = _laant_adresse_note(
+                        str(b.get("ElevensAdresse") or ""), laant_tekst, hvorfra
+                    )
+
+                    for k in b["koerselsraekker"]:
+                        k["Kommentar"] = _extend_kommentar(k.get("Kommentar"), note)
+
+                    laante_adresser += 1
+
         # (esdh_noegle, foerste_koersel_dato) is what tells one converted
         # bevilling from another on a re-run, and esdh_noegle is the same for
         # the whole case — so two buckets starting on the same day are
@@ -2969,6 +3032,16 @@ def retrieve_items_for_queue() -> list[dict]:
             "neither was set — each carries a comment naming what was found "
             "so a caseworker can put the real values on the bevilling.\n",
             hjaelpemiddel_rows,
+        )
+
+    if laante_adresser:
+        logger.warning(
+            "%d bevilling(er) could not resolve an address of their own and "
+            "borrowed one — from another bevilling on the same case, or the "
+            "student's current address. Without it the whole case would have "
+            "been rejected, active bevillinger included. Each says so on its "
+            "kørselsrækker.\n",
+            laante_adresser,
         )
 
     if byttede_datoer:
