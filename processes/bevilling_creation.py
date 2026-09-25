@@ -48,8 +48,7 @@ _MATRIKEL_STED = re.compile(r"\(([^)]+)\)")
 
 def _vaelg_matrikel(
     kandidater: list[dict],
-    skolens_adresse: str | None,
-    skole_navn: str | None,
+    skole_par: list,
 ) -> int | None:
     """Which matrikel a bevilling belongs to, when a skolekode has several.
 
@@ -62,15 +61,21 @@ def _vaelg_matrikel(
     carries SkolensAdresse — "Janesvej 2", "Stensagervej 11" — so the street
     in the address is what tells them apart. Matched on the normalised forms,
     so spacing and case do not matter and "Bøgeskov Høvej" finds "Bøgeskov
-    Høvej 10".
+    Høvej 10". SkoleNavnBefordring is tried too, because the source sometimes
+    names the site there instead: "Stensagerskolen (afd. Stensagervej)".
 
-    SkoleNavnBefordring is tried as well, because the source sometimes names
-    the site there instead: "Stensagerskolen (afd. Stensagervej)".
+    EVERY row's pair is tried, not just the bevilling's first non-None.
+    Those two columns are bevilling-level, so where the first row is a klub
+    row they name the klub — "Nygårdsvej 5, 8270 Højbjerg" — and the site is
+    unfindable even though a sibling row states it plainly.
+
+    The rows must agree. One matrikel across all of them is the answer; two
+    different ones is a real disagreement — some rows to Janesvej, some to
+    Stensagervej — and that is a case for a human, not a coin toss.
 
     Returns None when the code is unknown, exactly as before. Raises when the
-    code is known but the site cannot be told apart — a wrong school is worse
-    than a stopped case, and picking one of two at random is what this
-    replaces.
+    code is known but the site cannot be settled: a wrong school is worse
+    than a stopped case.
     """
 
     if not kandidater:
@@ -79,25 +84,38 @@ def _vaelg_matrikel(
     if len(kandidater) == 1:
         return kandidater[0]["id"]
 
-    haystack = _normalise(skolens_adresse) + "\x00" + _normalise(skole_navn)
+    fundet: dict[int, str] = {}
 
-    traeffere = [
-        k for k in kandidater
-        if (sted := _MATRIKEL_STED.search(str(k.get("label") or "")))
-        and _normalise(sted.group(1)) in haystack
-    ]
+    for par in skole_par or []:
+        adresse, navn = (list(par) + ["", ""])[:2]
+        haystack = _normalise(adresse) + "\x00" + _normalise(navn)
 
-    if len(traeffere) == 1:
-        return traeffere[0]["id"]
+        for k in kandidater:
+            sted = _MATRIKEL_STED.search(str(k.get("label") or ""))
+
+            if sted and _normalise(sted.group(1)) in haystack:
+                fundet[k["id"]] = str(k.get("label"))
+
+    if len(fundet) == 1:
+        return next(iter(fundet))
+
+    proevet = "; ".join(
+        f"{(list(p) + ['', ''])[0]!r} / {(list(p) + ['', ''])[1]!r}"
+        for p in skole_par or []
+    ) or "(ingen skolekolonner på rækkerne)"
 
     raise BusinessError(
         f"Skolekode {kandidater[0].get('skolekode')} har "
         f"{len(kandidater)} matrikler "
-        f"({', '.join(str(k.get('label')) for k in kandidater)}), og "
-        f"SkolensAdresse {skolens_adresse!r} / SkoleNavnBefordring "
-        f"{skole_navn!r} peger på "
-        f"{'ingen af dem' if not traeffere else 'flere af dem'}. "
-        "Kan ikke afgøre hvilken afdeling bevillingen hører til — "
+        f"({', '.join(str(k.get('label')) for k in kandidater)}). "
+        f"Rækkernes SkolensAdresse / SkoleNavnBefordring: {proevet}. "
+        + (
+            f"De peger på flere forskellige afdelinger ({', '.join(fundet.values())}) "
+            "— rækkerne er uenige."
+            if fundet
+            else "Ingen af dem peger på en afdeling."
+        )
+        + " Kan ikke afgøre hvilken afdeling bevillingen hører til — "
         "kræver manuel opfølgning."
     )
 
@@ -652,19 +670,20 @@ def create_bevilling(
         matrikel_kandidater = skolematrikel_map.get(skole_id, [])
         matrikel_id = _vaelg_matrikel(
             matrikel_kandidater,
-            bevilling.get("SkolensAdresse"),
-            bevilling.get("SkoleNavnBefordring"),
+            bevilling.get("skole_kandidater")
+            # Older queue items predate skole_kandidater; fall back to the
+            # bevilling-level pair so they still convert.
+            or [[bevilling.get("SkolensAdresse"), bevilling.get("SkoleNavnBefordring")]],
         )
 
         if len(matrikel_kandidater) > 1:
             logger.info(
                 "  Skolekode %s har %d matrikler — valgt %s ud fra "
-                "SkolensAdresse %r.\n",
+                "rækkernes skolekolonner.\n",
                 skole_id,
                 len(matrikel_kandidater),
                 next((k.get("label") for k in matrikel_kandidater
                       if k["id"] == matrikel_id), "?"),
-                bevilling.get("SkolensAdresse"),
             )
 
         raw_hjemmel = (bevilling.get("HjemmelForBevilling") or "").strip()

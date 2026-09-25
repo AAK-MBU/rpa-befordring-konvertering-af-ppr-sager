@@ -82,7 +82,11 @@ Vestergårdsskolen (Stensagervej)    751050
 
 `SkoleID` alone therefore does **not** identify a matrikel. `_vaelg_matrikel` tells the sites apart on the street in `SkolensAdresse`, matched against the site name the lookup label carries in parentheses — `Stensagervej 11` against `Stensagerskolen (Stensagervej)`. Compared through `_normalise`, so spacing and case do not matter and `Bøgeskov Høvej` finds `Bøgeskov Høvej 10`. `SkoleNavnBefordring` is tried too, because the source sometimes names the site there instead: `Stensagerskolen (afd. Stensagervej)`.
 
-An unknown skolekode still yields no matrikel, exactly as before. A known one whose site cannot be told apart **raises** and the case goes to `pending_user` — a wrong school is worse than a stopped case.
+**Every row's pair is tried, not just the bevilling's first non-None.** `SkolensAdresse` and `SkoleNavnBefordring` are bevilling-level columns, so where the first row is a klub row they name the *klub* — `Nygårdsvej 5, 8270 Højbjerg` — and the site is unfindable even though a sibling row states it plainly. `_skole_kandidater` collects every distinct pair in the bevilling and passes them all.
+
+The rows must **agree**. One matrikel across all of them is the answer; two different ones is a real disagreement — some rows to Janesvej, some to Stensagervej — and that is a case for a human, not a coin toss. The error names both the pairs tried and the sites they pointed at.
+
+An unknown skolekode still yields no matrikel, exactly as before. A known one whose site cannot be settled **raises** and the case goes to `pending_user` — a wrong school is worse than a stopped case.
 
 This was a live bug: `skolematrikel_map` was a dict keyed on skolekode, so the last entry won, and the lookup is ordered by `matrikel_navn`. Every `751903` student was being given `Stensagervej`, including the ones at `Janesvej`.
 
@@ -253,6 +257,26 @@ always did.
 
 A split is logged, naming what came out of it, since the source string no
 longer appears anywhere in the result.
+
+### Hjælpemidler and tillæg named in a comment
+
+Neither can be set reliably during the conversion. Hjælpemidler have **no source field at all**, and a tillæg is only recoverable where it was written into `BevillingAfKoerselstype` — a mention in free text carries no structure to convert.
+
+So the mention is surfaced rather than guessed at. `_hjaelpemiddel_traef` scans the source `Kommentar` for the lookup values plus the stem `hjælpemid`, and the kørselsrække gets:
+
+```
+KONVERTERING-PPR | hjælpemiddel eller tillæg nævnt i kommentaren
+Fundet: El-kørestol, Fast forsæde
+Kommentar: Barnet sidder i el-kørestol og skal have fast forsæde
+Hjælpemidler og tillæg kan ikke sættes pålideligt ud fra fritekst, så de er
+IKKE sat på bevillingen. Kontrollér og sæt dem manuelt.
+```
+
+- Matched through `_fold`, so `hjælpemiddel`, `hjælpemidler`, `HJAELPEMIDLER` and `el-koerestol` all hit. Only the **stem** is listed, not every ending.
+- A term wholly contained in another match is dropped, so `el-kørestol` reports once rather than as both `El-kørestol` and `Kørestol`.
+- Read from the **original** `Kommentar`, not the one being built — otherwise a note this run added would be matched back at us.
+
+**`_HJAELPEMIDDEL_ORD` must be kept in step with the `Hjaelpemiddel` and `KoerselstypeTillaeg` lookups** in `backend/db/seed/seed_lookup_data.sql`. A value added there and not here is simply never flagged; nothing breaks, the mention is just missed.
 
 ### Klub rows
 

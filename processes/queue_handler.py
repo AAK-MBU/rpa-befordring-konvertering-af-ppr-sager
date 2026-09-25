@@ -364,6 +364,34 @@ def _override_adresse(tekst: str | None) -> str | None:
     return None
 
 
+def _skole_kandidater(bev_rows: list[dict]) -> list[list[str]]:
+    """Every distinct (SkolensAdresse, SkoleNavnBefordring) in the bevilling.
+
+    Both are bevilling-level columns, so the first non-None wins — and where
+    the first row is a klub row, those columns name the klub rather than the
+    school. A school split across two sites under one skolekode is then
+    impossible to place, even though a sibling row says exactly which site it
+    is.
+
+    Passed as a list so bevilling_creation can try them all. Order preserved,
+    duplicates dropped, and rows with neither column left out entirely.
+    """
+
+    par: list[list[str]] = []
+
+    for row in bev_rows:
+        adresse = str(row.get("SkolensAdresse") or "").strip()
+        navn = str(row.get("SkoleNavnBefordring") or "").strip()
+
+        if not adresse and not navn:
+            continue
+
+        if [adresse, navn] not in par:
+            par.append([adresse, navn])
+
+    return par
+
+
 def _saml_etage_doer(components: list[str]) -> list[str]:
     """Merge a floor and door the source split across separate components.
 
@@ -2240,6 +2268,76 @@ def _fold(value: str | None) -> str:
     return folded
 
 
+# Words in a comment that mean a hjælpemiddel or a tillæg is involved.
+#
+# The lookup values themselves, plus the stem "hjælpemid" so hjælpemiddel,
+# hjælpemidler and the ae-spellings all hit — _fold flattens æ/ø/å, so only
+# the stem has to be written down, not every ending.
+#
+# Keep this in step with the Hjaelpemiddel and KoerselstypeTillaeg lookups in
+# backend/db/seed/seed_lookup_data.sql. A value added there and not here is
+# simply not flagged; nothing breaks, the mention is just missed.
+_HJAELPEMIDDEL_ORD: tuple[str, ...] = (
+    "hjælpemid",
+    # Hjaelpemiddel
+    "Magnetsele",
+    "Selekappe",
+    "Krampeplan",
+    "El-kørestol",
+    "Kørestol",
+    "Krykker",
+    "Autostol",
+    # KoerselstypeTillaeg
+    "Fast forsæde",
+    "Fast sæde",
+    "Co-driver",
+    "Egen ledsager",
+)
+
+
+def _hjaelpemiddel_traef(kommentar: str | None) -> list[str]:
+    """Which hjælpemiddel or tillæg words a comment mentions.
+
+    Matched through _fold, so case, spacing and æ/ø/å versus ae/oe/aa all
+    hit — "el-koerestol" finds the same row as "El-kørestol".
+
+    A term wholly contained in another match is dropped: a comment saying
+    "el-kørestol" matches both that and "Kørestol", and reporting both reads
+    as two findings when it is one.
+    """
+
+    haystack = _fold(kommentar)
+
+    if not haystack:
+        return []
+
+    traef = [ord_ for ord_ in _HJAELPEMIDDEL_ORD if _fold(ord_) in haystack]
+
+    return [
+        t for t in traef
+        if not any(a != t and _fold(t) in _fold(a) for a in traef)
+    ]
+
+
+def _hjaelpemiddel_note(kommentar: str | None, traef: list[str]) -> str:
+    """The comment left on a kørselsrække that mentions a hjælpemiddel or tillæg.
+
+    Neither can be set reliably during the conversion. Hjælpemidler have no
+    source field at all, and a tillæg is only recoverable where it was
+    written into BevillingAfKoerselstype — a mention in free text carries no
+    structure to convert. So the mention is surfaced rather than guessed at,
+    and a caseworker sets the real values.
+    """
+
+    return _konverterings_note(
+        "hjælpemiddel eller tillæg nævnt i kommentaren",
+        f"Fundet: {', '.join(traef)}",
+        f"Kommentar: {str(kommentar or '').strip()}",
+        "Hjælpemidler og tillæg kan ikke sættes pålideligt ud fra fritekst, "
+        "så de er IKKE sat på bevillingen. Kontrollér og sæt dem manuelt.",
+    )
+
+
 def _naevner_klub(*vaerdier) -> bool:
     """Whether any of these values mentions a klub."""
 
@@ -2513,6 +2611,7 @@ def retrieve_items_for_queue() -> list[dict]:
     klub_rows = 0
     klub_bevillinger = 0
     byttede_datoer = 0
+    hjaelpemiddel_rows = 0
     byttede_datoer_aabne = 0
     omvendte_datoer: set[str] = set()
     noterede_rows = 0
@@ -2639,6 +2738,19 @@ def retrieve_items_for_queue() -> list[dict]:
                     koersel.get("Kommentar"), adresse_note
                 )
 
+                # A hjælpemiddel or tillæg named in the source comment. Read
+                # from the ORIGINAL comment, not koersel["Kommentar"], which
+                # by now may carry notes this run added — matching those would
+                # flag our own words back at us.
+                traef = _hjaelpemiddel_traef(row.get("Kommentar"))
+
+                if traef:
+                    hjaelpemiddel_rows += 1
+                    koersel["Kommentar"] = _extend_kommentar(
+                        koersel.get("Kommentar"),
+                        _hjaelpemiddel_note(row.get("Kommentar"), traef),
+                    )
+
                 koersel["Kommentar"] = _extend_kommentar(
                     koersel.get("Kommentar"), lukket_note
                 )
@@ -2753,6 +2865,12 @@ def retrieve_items_for_queue() -> list[dict]:
                 **bevilling_data,
                 "adresse_id": bevilling_adresse_id,
                 "adresse_id_kandidater": bevilling_adresse_kandidater,
+                # Every row's school columns, not just the first non-None the
+                # bevilling-level pass picked. Several schools share a
+                # skolekode across two sites, and only these columns say
+                # which — so a bevilling whose first row happens to name a
+                # klub there must still be able to fall back on its siblings.
+                "skole_kandidater": _skole_kandidater(bev_rows),
                 "bucket": bev_key[0],
                 "foerste_koersel_dato": foerste_koersel_dato,
                 "sagsbehandlingsdato": sagsbehandlingsdato,
@@ -2825,6 +2943,15 @@ def retrieve_items_for_queue() -> list[dict]:
             "the befordring must be rebuilt by hand.\n",
             klub_bevillinger,
             klub_rows,
+        )
+
+    if hjaelpemiddel_rows:
+        logger.warning(
+            "%d kørselsrække(r) mention a hjælpemiddel or tillæg in the "
+            "source comment. Neither can be set reliably from free text, so "
+            "neither was set — each carries a comment naming what was found "
+            "so a caseworker can put the real values on the bevilling.\n",
+            hjaelpemiddel_rows,
         )
 
     if byttede_datoer:
