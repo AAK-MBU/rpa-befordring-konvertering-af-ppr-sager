@@ -106,6 +106,8 @@ Et selvstændigt script — ikke en del af konverteringen, og det skriver intet 
 
 Mangler eleven i **Elev**, afvises alle bevillinger for den elev. Mangler eleven i **LOIS**, er der ingen reserveadresse, når en klubrække eller en lukket sag ikke kan slås op. De to fejler forskelligt og rapporteres derfor hver for sig.
 
+Begge opslag er batchede. Er `DBCONNECTIONSTRINGBEFORDRING` sat — samme variabel som nattekørslen bruger — slås `Elev` op med nogle få `IN (…)`-forespørgsler i stedet for ét API-kald pr. elev: 2000 CPR'er koster tre forespørgsler frem for to tusinde. Er den ikke sat, falder scriptet tilbage til API'et og siger det. `--api` fremtvinger API-vejen.
+
 Resultatet skrives til `elevtjek.csv` og `elevtjek.xlsx`, sorteret så det, der kræver handling, står øverst.
 
 ## Uløste adresser til sagsbehandlerne

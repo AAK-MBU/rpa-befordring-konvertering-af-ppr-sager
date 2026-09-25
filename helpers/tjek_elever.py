@@ -9,7 +9,10 @@ a time.
 
 For every distinct CPR in BefordringsData it answers two questions:
 
-    in Elev?    /citizen/stamdata/{cpr} in the befordring API.
+    in Elev?    The Elev table in Befordringssystemet, read directly where
+                DBCONNECTIONSTRINGBEFORDRING is set — two chunked queries
+                rather than a few thousand HTTP calls. Without it, the same
+                answer via /citizen/stamdata/{cpr}, one request per CPR.
                 A miss means every bevilling for that student is rejected:
                 Bevilling.cpr_elev is a trusted foreign key, so the row
                 cannot be created at all.
@@ -22,8 +25,10 @@ For every distinct CPR in BefordringsData it answers two questions:
 The two are independent and fail differently, which is why they are reported
 separately rather than as one "known" flag.
 
-Environment: API_ENDPOINT, API_KEY, DBCONNECTIONSTRINGSERVER29 (as the
-conversion uses), and RPAConnection for the BefordringsData connection.
+Environment: DBCONNECTIONSTRINGSERVER29 for LOIS and RPAConnection for
+BefordringsData, both as the conversion uses them. For the Elev check,
+either DBCONNECTIONSTRINGBEFORDRING (fast) or API_ENDPOINT + API_KEY (slow
+fallback); --api forces the latter.
 """
 
 import argparse
@@ -144,12 +149,56 @@ def _lois_status(cprs: list[str], chunk: int = 900) -> dict[str, str | None]:
     return fundet
 
 
+def _elev_status_db(cprs: list[str], chunk: int = 900) -> dict[str, bool] | None:
+    """cpr -> in Elev, read straight from Befordringssystemet. None if no DSN.
+
+    Two chunked queries instead of a few thousand HTTP round trips, which is
+    the difference between seconds and minutes. Same variable the nightly run
+    uses, so a machine running both RPAs already has it.
+
+    Direct SQL rather than the API is a deliberate exception for this script.
+    The conversion itself is API-only on purpose; a read-only diagnostic that
+    already queries LOIS directly has no such constraint, and there is no
+    bulk endpoint to use instead.
+
+    Chunked at 900 for the same reason as everywhere else: SQL Server caps a
+    statement at 2100 parameters.
+    """
+
+    conn_string = os.getenv("DBCONNECTIONSTRINGBEFORDRING")
+
+    if not conn_string:
+        return None
+
+    fundet: set[str] = set()
+
+    with pyodbc.connect(conn_string) as conn:
+        cursor = conn.cursor()
+
+        for offset in range(0, len(cprs), chunk):
+            batch = cprs[offset:offset + chunk]
+            placeholders = ",".join("?" for _ in batch)
+
+            cursor.execute(
+                f"SELECT [cpr] FROM [befordring].[Elev] "
+                f"WHERE [cpr] IN ({placeholders})",
+                batch,
+            )
+
+            fundet.update(_cpr_cifre(row[0]) for row in cursor.fetchall())
+
+            logger.info("Elev: %d/%d checked", min(offset + chunk, len(cprs)), len(cprs))
+
+    return {cpr: cpr in fundet for cpr in cprs}
+
+
 def _elev_status(cprs: list[str], workers: int = 8) -> dict[str, bool]:
     """cpr -> whether the befordring API knows the student.
 
-    One request each, because there is no bulk endpoint. Run in a small
-    thread pool: a few thousand sequential round trips is minutes of waiting
-    for no reason, and eight at a time is gentle on the API.
+    The fallback, used when DBCONNECTIONSTRINGBEFORDRING is not set. One
+    request each, because the API has no bulk endpoint. Run in a small thread
+    pool: a few thousand sequential round trips is minutes of waiting for no
+    reason, and eight at a time is gentle on the API.
 
     A request that FAILS is recorded as None rather than False, so a network
     blip cannot be read as "this student does not exist".
@@ -263,6 +312,9 @@ def main() -> None:
                         help="samtidige API-kald mod /citizen/stamdata")
     parser.add_argument("--ud", default="elevtjek",
                         help="filnavn uden endelse")
+    parser.add_argument("--api", action="store_true",
+                        help="tjek Elev via API'et i stedet for direkte "
+                             "databaseopslag, selv hvis forbindelsen findes")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -280,7 +332,16 @@ def main() -> None:
         print(f"ADVARSEL: {uden_cpr} række(r) har intet brugbart CPR og kan aldrig konverteres")
 
     lois = _lois_status(cprs)
-    elev = _elev_status(cprs, workers=args.workers)
+
+    elev = None if args.api else _elev_status_db(cprs)
+
+    if elev is None:
+        print("Elev slås op via API'et, ét kald pr. CPR — det tager et stykke tid."
+              if args.api else
+              "DBCONNECTIONSTRINGBEFORDRING er ikke sat — falder tilbage til "
+              "API'et med ét kald pr. CPR. Sæt den for at gøre det væsentligt "
+              "hurtigere.")
+        elev = _elev_status(cprs, workers=args.workers)
 
     raekker = []
 
