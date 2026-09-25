@@ -89,3 +89,10 @@ ADDRESS_REPLACEMENTS_CSV = "adresse_erstatninger.csv"
 #
 # Set to None to switch it off.
 UNRESOLVED_ADDRESS_CSV = "uloeste_adresser.csv"
+
+# The same worklist as a spreadsheet, which is what it actually gets opened
+# in. Filterable header, frozen top row, readable column widths — none of
+# which a CSV can carry.
+#
+# Both are written; set either to None to switch that one off.
+UNRESOLVED_ADDRESS_XLSX = "uloeste_adresser.xlsx"

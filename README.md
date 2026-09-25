@@ -96,6 +96,14 @@ ORDER  BY b.cpr_elev, b.bevilling_id;
 
 Typen står efter lodret streg: `adressematch`, `adresse valgt via CPR`, `adresse rettet via CPR`, `adresse antaget — manglende etage/dør`, `lukket sag — elevens nuværende adresse` og `klub i kildedata`. En kørselsrække kan have flere, og sagsbehandlerens egen tekst bevares øverst.
 
+## Uløste adresser til sagsbehandlerne
+
+Hver kørsel skriver de adresser, der ikke kunne slås op, til `uloeste_adresser.csv` og `uloeste_adresser.xlsx` — samme rækker i begge. Kolonner: PPR-sag, CPR, adressen som den står i BefordringsData, hvor CPR har eleven boende, årsagen, og hvad registret har på vejen.
+
+Én række pr. sag og elev bag hver adresse, sorteret efter sag. Filerne overskrives hver kørsel, så en adresse, der bliver rettet i kilden, forsvinder af sig selv.
+
+Filtrér først på `aarsag`: en **klubadresse** er forventet og er ikke arbejde — den bevilling oprettes på elevens egen adresse.
+
 ## Manuelle adresserettelser
 
 `adresse_erstatninger.csv` med kolonnerne `Find` og `Erstat` retter formuleringer, ingen regel kan udlede — fx et forkortet vejnavn:

@@ -8,6 +8,7 @@ dependencies = [
     "automation-server-client @ git+https://github.com/odense-rpa/automation-server-client.git",
     "mbu-dev-shared-components>=3.0.0",
     "mbu-rpa-core>=0.2.5",
+    "openpyxl>=3.1",
     "pillow",
     "requests_ntlm >= 1.2.0",
     "ruff"

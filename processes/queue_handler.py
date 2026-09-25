@@ -1317,7 +1317,79 @@ _ULOEST_FELTER = (
 )
 
 
-def _skriv_uloeste_csv(
+def _skriv_uloeste_xlsx(raekker: list[dict]) -> None:
+    """The same worklist as a spreadsheet, which is what it gets opened in.
+
+    Adds what a CSV cannot carry: a filterable header — so aarsag can be
+    narrowed to the rows that are actually work in one click — a frozen top
+    row, and column widths wide enough to read an address without dragging.
+
+    openpyxl is imported here rather than at module load so a missing package
+    costs the spreadsheet and nothing else; the CSV is already written by the
+    time this runs, and the conversion does not depend on either.
+    """
+
+    navn = getattr(config, "UNRESOLVED_ADDRESS_XLSX", None)
+
+    if not navn:
+        return
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        logger.warning(
+            "openpyxl is not installed, so %s was not written. The CSV has "
+            "the same rows.\n",
+            navn,
+        )
+
+        return
+
+    path = Path(navn)
+
+    # Wide enough for an address, narrow enough to see several columns.
+    bredder = {
+        "ppr_sag": 24, "cpr": 14, "kilde_adresse": 46,
+        "elev_adresse_iflg_cpr": 46, "aarsag": 34, "registret_har": 60,
+    }
+
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Uløste adresser"
+
+        ws.append(list(_ULOEST_FELTER))
+
+        for celle in ws[1]:
+            celle.font = Font(bold=True)
+
+        for raekke in raekker:
+            ws.append([raekke[felt] for felt in _ULOEST_FELTER])
+
+        for i, felt in enumerate(_ULOEST_FELTER, start=1):
+            bogstav = get_column_letter(i)
+            ws.column_dimensions[bogstav].width = bredder.get(felt, 20)
+
+            # Left-aligned and wrapped: these are addresses, not numbers, and
+            # CPR must not be right-aligned like a figure.
+            for celle in ws[bogstav][1:]:
+                celle.alignment = Alignment(vertical="top", wrap_text=True)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        wb.save(path)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not write %s: %s\n", path, exc)
+
+        return
+
+    logger.info("Wrote the same %d row(s) to %s.\n", len(raekker), path)
+
+
+def _skriv_uloeste(
     unresolved: list[dict],
     lois_adresse_id: dict[str, str],
     lois_tekst: dict[str, str],
@@ -1337,12 +1409,6 @@ def _skriv_uloeste_csv(
     the file disagree with the log.
     """
 
-    navn = getattr(config, "UNRESOLVED_ADDRESS_CSV", None)
-
-    if not navn:
-        return
-
-    path = Path(navn)
     raekker: list[dict] = []
 
     for entry in unresolved:
@@ -1376,6 +1442,15 @@ def _skriv_uloeste_csv(
     # By case, not by address: the file is worked through a case at a time,
     # and the resolver's own order is alphabetical by normalised address.
     raekker.sort(key=lambda r: (r["ppr_sag"], r["cpr"], r["kilde_adresse"]))
+
+    _skriv_uloeste_xlsx(raekker)
+
+    navn = getattr(config, "UNRESOLVED_ADDRESS_CSV", None)
+
+    if not navn:
+        return
+
+    path = Path(navn)
 
     try:
         # utf-8-sig so Excel opens æ/ø/å correctly — this file is for people,
@@ -2096,7 +2171,7 @@ def _resolve_adresse_ids(
     if unresolved:
         klub_antal = sum(1 for e in unresolved if e.get("klub"))
 
-        _skriv_uloeste_csv(unresolved, lois_adresse_id, lois_tekst)
+        _skriv_uloeste(unresolved, lois_adresse_id, lois_tekst)
 
         logger.warning(
             "%d address(es) unresolved. %d of them are klub addresses, which "

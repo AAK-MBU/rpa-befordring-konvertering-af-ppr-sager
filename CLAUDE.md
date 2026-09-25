@@ -610,7 +610,13 @@ Every address the run could not resolve, written out for the caseworkers. Path i
 
 `aarsag` is the column to filter on first. A **klubadresse** is expected not to resolve and its bevilling is created on the student's own address — it is in the file only so the file and the log agree, not because it is work.
 
-Written as `utf-8-sig` so Excel opens `æ/ø/å` correctly; this one is for people rather than for another program.
+Written **twice**, as CSV and as `uloeste_adresser.xlsx` — same rows, same order. The CSV is `utf-8-sig` so Excel opens `æ/ø/å` correctly; the spreadsheet adds what a CSV cannot carry:
+
+- a **filterable header**, so `aarsag` narrows to the rows that are actually work in one click
+- a frozen top row
+- column widths wide enough to read an address without dragging, wrapped and top-aligned
+
+`openpyxl` is imported inside the writer rather than at module load, so a missing package costs the spreadsheet and nothing else — the CSV is already written by then, and the conversion depends on neither. It is in `pyproject.toml`, but an environment that has not been updated logs a line and carries on.
 
 ### Reading an unresolved address
 
