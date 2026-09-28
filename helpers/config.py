@@ -6,21 +6,42 @@ MAX_RETRY = 10
 # Queue population settings
 # ----------------------
 MAX_CONCURRENCY = 100  # tune based on backend capacity
+
+# --- Manuelle skolematrikel-afgørelser -------------------------------------
+#
+# PPR-sags-ID -> den skolematrikel bevillingen skal oprettes på.
+#
+# Nogle sager kan ikke placeres ud fra rækkerne alene. Et eksempel er en sag
+# med UDELUKKENDE klubkørsel (skole -> klub -> hjem): ingen række navngiver
+# skolen i SkolensAdresse/SkoleNavnBefordring, fordi begge kolonner beskriver
+# klubturen, og en skolekode med to afdelinger kan derfor ikke afgøres.
+#
+# Her afgør et menneske det i stedet. Konverteringen opretter bevillingen på
+# den valgte matrikel og skriver en KONVERTERING-PPR-kommentar på hver
+# kørselsrække, så sagsbehandleren kan rette bevillingen bagefter.
+#
+# "matrikel" skal staves NØJAGTIGT som labelen i /lookup/skolematrikel — fx
+# "Stensagerskolen (Stensagervej)". En forkert label stopper konverteringen
+# med en ProcessError, så en tastefejl ikke bliver til en forkert skole.
+#
+# "skolekode" er valgfri. Er den sat, gælder afgørelsen kun den bevilling på
+# sagen, der har netop den SkoleID — så en sag med to bevillinger på hver sin
+# skole ikke bliver ramt begge steder.
+MATRIKEL_OVERRIDES: dict[str, dict[str, str]] = {
+    "PPR-2017-056295-006": {
+        "matrikel": "Stensagerskolen (Stensagervej)",
+        "skolekode": "751903",
+        "begrundelse": (
+            "Sagen er kun klubkørsel (skole -> klub -> hjem), så ingen "
+            "række navngiver skolen. Sagsbehandleren har bekræftet "
+            "Stensagervej, og skole -> klub-rækkens ElevensAdresse siger "
+            "det samme."
+        ),
+    },
+}
+
 MAX_RETRIES = 3  # transient failure retries per item
 RETRY_BASE_DELAY = 0.5  # seconds (exponential backoff)
-
-
-# --- Conversion window -----------------------------------------------------
-#
-# Rows in BefordringsData whose validity period overlaps [today, window end]
-# are converted into the student's ONE active bevilling. See _bucket_key in
-# processes/queue_handler.py for the full rule.
-#
-# Left as None the window ends one month from the day the queue phase runs.
-# Pin it to a date (e.g. date(2026, 10, 21)) to make the grouping reproducible
-# across runs — worth doing once a conversion date is agreed, so a re-queue
-# after a failure buckets the rows exactly as the first attempt did.
-CONVERSION_WINDOW_END = None
 
 
 # --- Resolved-address cache ---------------------------------------------

@@ -104,6 +104,28 @@ A known one whose site cannot be settled depends on the bucket:
 
 This was a live bug: `skolematrikel_map` was a dict keyed on skolekode, so the last entry won, and the lookup is ordered by `matrikel_navn`. Every `751903` student was being given `Stensagervej`, including the ones at `Janesvej`.
 
+### Manual decisions — `config.MATRIKEL_OVERRIDES`
+
+Some cases cannot be placed from the rows at all. A case with **only klub kørsel** — `skole -> klub -> hjem`, no home-to-school leg — has both school columns describing the klub on *every* row, so a split skolekode has nothing to choose on. The information simply is not in `BefordringsData`; a caseworker has it.
+
+`helpers/config.py` holds a hand-maintained map, PPR case ID → matrikel:
+
+```python
+MATRIKEL_OVERRIDES = {
+    "<PPR case id>": {
+        "matrikel": "Stensagerskolen (Stensagervej)",
+        "skolekode": "751903",          # optional — narrows it to one bevilling
+        "begrundelse": "Kun klubkørsel; sagsbehandleren har bekræftet afdelingen.",
+    },
+}
+```
+
+It wins over everything, including an unknown skolekode, and the kørselsrækker get a `skole sat manuelt` comment carrying the begrundelse and the choice, so the caseworker can correct the bevilling afterwards.
+
+Named by **label**, not `matrikel_id`: ids are per-environment identity values and a bare number in a config file cannot be reviewed, while `Stensagerskolen (Stensagervej)` can. A label that does not exist in the lookup raises `ProcessError` — a typo is an operator error, not something a caseworker resolves, and converting to a silently wrong school is the one outcome worth failing to avoid.
+
+The optional `skolekode` matters on a case with two bevillinger at two different schools: without it, the decision would be forced onto both.
+
 ### Mapping decisions worth knowing
 
 | Source | Target | How |
@@ -148,12 +170,12 @@ when they apply rather than by their exact dates:
 
 | Bucket | Rule | Result |
 |---|---|---|
-| `current` | period overlaps `[today, window_end]` | **one** bevilling — computes as Aktiv |
-| `future` | period starts after `window_end` | **one** bevilling — computes as Kommende |
+| `current` | period covers today | **one** bevilling — computes as Aktiv |
+| `future` | period starts after today | **one** bevilling — computes as Kommende |
 | `past` | already ended | one bevilling **per distinct period** — Udløbet, which does not collide |
 | `ukendt` | dates missing or unreadable | kept apart under the raw values, and logged |
 
-`window_end` is one month from the run date, or `config.CONVERSION_WINDOW_END` when pinned. Pinning it makes the grouping reproducible across runs, which is worth doing once a conversion date is agreed.
+The boundary is today, and only today. An earlier version stretched `current` a month ahead so a bevilling starting shortly after the conversion joined the active one, but that put a bevilling that has not started yet on the same record as the one running now, and made the grouping depend on which day the queue phase ran. A row starting tomorrow is Kommende.
 
 Future rows are merged even where their periods are far apart. The legacy data is not detailed enough to split them into meaningful separate bevillinger, and only one may become Aktiv later in any case.
 

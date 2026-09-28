@@ -1,7 +1,6 @@
 """Module to handle queue population"""
 
 import asyncio
-import calendar
 import csv
 import json
 import logging
@@ -2433,15 +2432,6 @@ def _klub_note(
     )
 
 
-def _one_month_on(day: date) -> date:
-    """The same day one month later, clamped to the end of a shorter month."""
-
-    year = day.year + (day.month // 12)
-    month = day.month % 12 + 1
-
-    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
-
-
 def _as_date(value) -> date | None:
     """Parse a BefordringsData date, or None when it is absent or unreadable."""
 
@@ -2457,7 +2447,7 @@ def _as_date(value) -> date | None:
         return None
 
 
-def _bucket_key(row: dict, today: date, window_end: date) -> tuple:
+def _bucket_key(row: dict, today: date) -> tuple:
     """Which bevilling a BefordringsData row belongs to, within its case.
 
     The old grouping put every distinct (BevillingFra, BevillingTil) on its own
@@ -2468,11 +2458,11 @@ def _bucket_key(row: dict, today: date, window_end: date) -> tuple:
 
     So rows are bucketed by when they apply rather than by their exact dates:
 
-      ("current",)            period overlaps [today, window_end]
+      ("current",)            period covers today
                               -> ONE bevilling, which the status engine will
                                  compute as Aktiv. Merging these is the point.
 
-      ("future",)             period starts after window_end
+      ("future",)             period starts after today
                               -> ONE bevilling, computed as Kommende. Also
                                  merged, even where the periods are far apart:
                                  the legacy data is not detailed enough to
@@ -2488,6 +2478,13 @@ def _bucket_key(row: dict, today: date, window_end: date) -> tuple:
                               -> kept apart under the raw values rather than
                                  guessed into a bucket. Logged by the caller.
 
+    The boundary is today, and only today. An earlier version stretched
+    "current" a month ahead so a bevilling starting shortly after the
+    conversion was merged into the active one, but that put a bevilling that
+    has not started yet on the same record as the one running now, and made
+    the grouping depend on which day the queue phase happened to run. A row
+    starting tomorrow is Kommende, which is what it is.
+
     Nothing here assigns a status: the status engine derives Aktiv / Kommende /
     Udløbet from the kørselsrække dates once the rows exist. This only decides
     which rows share a bevilling.
@@ -2499,10 +2496,10 @@ def _bucket_key(row: dict, today: date, window_end: date) -> tuple:
     if fra is None or til is None:
         return ("ukendt", str(row.get("BevillingFra")), str(row.get("BevillingTil")))
 
-    if fra <= window_end and til >= today:
+    if fra <= today <= til:
         return ("current",)
 
-    if fra > window_end:
+    if fra > today:
         return ("future",)
 
     return ("past", fra.isoformat(), til.isoformat())
@@ -2629,16 +2626,15 @@ def retrieve_items_for_queue() -> list[dict]:
         )
 
     today = date.today()
-    window_end = config.CONVERSION_WINDOW_END or _one_month_on(today)
 
     logger.info(
-        "Conversion window: %s to %s. Rows overlapping it become each "
-        "student's one active bevilling.\n",
+        "Bucketing rows as of %s: a period covering today becomes the "
+        "student's one active bevilling, one starting later becomes the "
+        "kommende one.\n",
         today.isoformat(),
-        window_end.isoformat(),
     )
 
-    undated = [r for r in rows if _bucket_key(r, today, window_end)[0] == "ukendt"]
+    undated = [r for r in rows if _bucket_key(r, today)[0] == "ukendt"]
 
     if undated:
         logger.warning(
@@ -2675,7 +2671,7 @@ def retrieve_items_for_queue() -> list[dict]:
         # _bucket_key for why current and future rows are merged rather than
         # split by their exact dates.
         def bucket_of(row):
-            return _bucket_key(row, today, window_end)
+            return _bucket_key(row, today)
 
         case_rows = sorted(case_rows, key=lambda r: (bucket_of(r), str(r.get("CaseDBID") or "")))
 

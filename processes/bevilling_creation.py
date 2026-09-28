@@ -14,6 +14,8 @@ import requests
 
 from mbu_rpa_core.exceptions import BusinessError, ProcessError
 
+from helpers import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +95,20 @@ def _extend_kommentar(kommentar: str | None, note: str | None) -> str | None:
     return f"{eksisterende}\n\n{note}" if eksisterende else note
 
 
+def _navngiver(tekst: str, navn: str) -> bool:
+    """Does `tekst` name `navn` — at a word boundary, not mid-word?"""
+
+    start = tekst.find(navn)
+
+    while start != -1:
+        if start == 0 or not tekst[start - 1].isalpha():
+            return True
+
+        start = tekst.find(navn, start + 1)
+
+    return False
+
+
 def _matrikler_andetsteds(
     skole_par: list,
     alle_matrikler: list[dict] | None,
@@ -126,6 +142,12 @@ def _matrikler_andetsteds(
     A row that names the school but not the site still counts. Both sites
     then come back, which is enough: they share a skolekode, and the
     skolekode is the field being questioned.
+
+    The name has to sit on a word boundary, not merely occur somewhere in the
+    string. Folding removes the spaces, and "Ellevangskolen" is a substring of
+    "Møllevangskolen" — two real Aarhus schools under two skolekoder — so a
+    bare containment test names Ellevangskolen on every Møllevangskolen row.
+    Start of string, or a non-letter in front, is the whole guard.
     """
 
     if not alle_matrikler:
@@ -152,7 +174,7 @@ def _matrikler_andetsteds(
             skole = _MATRIKEL_SKOLE.match(label)
             skole_foldet = _uden_accent(skole.group(1) if skole else label)
 
-            if not skole_foldet or skole_foldet not in navn_foldet:
+            if not skole_foldet or not _navngiver(navn_foldet, skole_foldet):
                 continue
 
             sted = _MATRIKEL_STED.search(label)
@@ -179,11 +201,73 @@ def _forkert_skoleid(andre: list[dict], skolekode: object) -> str:
     )
 
 
+def _manuel_matrikel(
+    ppr_case_id: str | None,
+    skolekode: object,
+    alle_matrikler: list[dict] | None,
+) -> tuple[int, str] | None:
+    """A hand-made decision from config.MATRIKEL_OVERRIDES, or None.
+
+    Some cases cannot be placed from the rows at all. A case with ONLY klub
+    kørsel — skole -> klub -> hjem, no home-to-school leg — has both school
+    columns describing the klub on every row, so a skolekode split across two
+    sites has nothing to choose on. The information is outside the data; a
+    caseworker has it.
+
+    Keyed on the PPR case ID, optionally narrowed by skolekode so a case with
+    two bevillinger at two schools is not forced onto one of them.
+
+    Named by LABEL, not by matrikel_id: ids are per-environment identity
+    values and a number in a config file cannot be reviewed, while
+    "Stensagerskolen (Stensagervej)" can. A label that does not exist raises
+    ProcessError — a typo is an operator error, not a case a caseworker can
+    resolve, and converting to a silently wrong school is the one outcome
+    worth failing to avoid.
+    """
+
+    valg = (config.MATRIKEL_OVERRIDES or {}).get(str(ppr_case_id or "").strip())
+
+    if not valg:
+        return None
+
+    kun_skolekode = str(valg.get("skolekode") or "").strip()
+
+    if kun_skolekode and kun_skolekode != str(skolekode or "").strip():
+        return None
+
+    label = str(valg.get("matrikel") or "").strip()
+    valgt = next(
+        (k for k in (alle_matrikler or []) if str(k.get("label") or "") == label),
+        None,
+    )
+
+    if valgt is None:
+        raise ProcessError(
+            f"MATRIKEL_OVERRIDES for PPR-sag {ppr_case_id} peger på "
+            f"skolematrikel {label!r}, som ikke findes i /lookup/skolematrikel. "
+            "Ret labelen i helpers/config.py — den skal staves nøjagtigt som "
+            "i opslaget."
+        )
+
+    note = _konverterings_note(
+        "skole sat manuelt",
+        "Skolen kunne ikke udledes af rækkerne, så den er sat manuelt ved "
+        "konverteringen.",
+        str(valg.get("begrundelse") or "").strip()
+        or "Ingen begrundelse angivet i konverteringens opsætning.",
+        f"Valgt: {valgt.get('label')}",
+        "Ret bevillingen, hvis den skal være anderledes.",
+    )
+
+    return valgt["id"], note
+
+
 def _vaelg_matrikel(
     kandidater: list[dict],
     skole_par: list,
     bucket: str | None = None,
     alle_matrikler: list[dict] | None = None,
+    ppr_case_id: str | None = None,
 ) -> tuple[int | None, str | None]:
     """Which matrikel a bevilling belongs to, when a skolekode has several.
 
@@ -228,9 +312,21 @@ def _vaelg_matrikel(
     like a bad address. It only sharpens the message; the site is never
     resolved from it. See _matrikler_andetsteds.
 
-    Returns (matrikel_id, note). The note is None unless a guess was made.
-    An unknown skolekode yields (None, None), exactly as before.
+    A hand-made decision in config.MATRIKEL_OVERRIDES wins over all of it,
+    including over an unknown skolekode. See _manuel_matrikel.
+
+    Returns (matrikel_id, note). The note is None unless a guess or a manual
+    decision was made. An unknown skolekode yields (None, None), as before.
     """
+
+    manuel = _manuel_matrikel(
+        ppr_case_id,
+        kandidater[0].get("skolekode") if kandidater else None,
+        alle_matrikler,
+    )
+
+    if manuel:
+        return manuel
 
     if not kandidater:
         return None, None
@@ -883,9 +979,20 @@ def create_bevilling(
             or [[bevilling.get("SkolensAdresse"), bevilling.get("SkoleNavnBefordring")]],
             bevilling.get("bucket"),
             skolematrikler,
+            ppr_case_id,
         )
 
-        if matrikel_note:
+        if matrikel_note and "skole sat manuelt" in matrikel_note:
+            logger.warning(
+                "  Skolekode %s: skolen er sat manuelt fra "
+                "MATRIKEL_OVERRIDES — %s. Kørselsrækkerne får en kommentar.\n",
+                skole_id,
+                next(
+                    (k.get("label") for k in skolematrikler if k["id"] == matrikel_id),
+                    matrikel_id,
+                ),
+            )
+        elif matrikel_note:
             logger.warning(
                 "  Skolekode %s: afdelingen kunne ikke afgøres, og "
                 "bevillingen er udløbet — gættet. Kørselsrækkerne får en "

@@ -44,14 +44,14 @@ Faserne er uafhængige og kan kombineres.
 
 | Gruppe | Regel | Resultat |
 |---|---|---|
-| `current` | perioden overlapper `[i dag, vinduets slutning]` | **én** bevilling — beregnes som Aktiv |
-| `future` | perioden begynder efter vinduet | **én** bevilling — beregnes som Kommende |
+| `current` | perioden dækker i dag | **én** bevilling — beregnes som Aktiv |
+| `future` | perioden begynder efter i dag | **én** bevilling — beregnes som Kommende |
 | `past` | allerede udløbet | én bevilling **pr. periode** — Udløbet, som ikke kolliderer |
 | `ukendt` | datoer mangler eller kan ikke læses | holdes for sig og logges |
 
    Grunden til at de aktuelle rækker slås sammen: `usp_recalculate_bevilling_status` sætter en borger med mere end én **Aktiv** bevilling til Fejlet. To overlappende gamle rækker ville ramme netop det og vælte hele sagen.
 
-   Vinduet slutter en måned efter kørselsdatoen, eller på `config.CONVERSION_WINDOW_END`, hvis den er sat. Sæt den, når konverteringsdatoen er aftalt — så giver en gentaget kørsel samme gruppering.
+   Grænsen er i dag og kun i dag. En række, der begynder i morgen, er Kommende — ikke aktiv.
 
 ### `--process`
 
