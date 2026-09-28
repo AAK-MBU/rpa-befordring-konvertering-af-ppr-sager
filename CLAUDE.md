@@ -177,6 +177,19 @@ when they apply rather than by their exact dates:
 
 The boundary is today, and only today. An earlier version stretched `current` a month ahead so a bevilling starting shortly after the conversion joined the active one, but that put a bevilling that has not started yet on the same record as the one running now, and made the grouping depend on which day the queue phase ran. A row starting tomorrow is Kommende.
 
+**A `future` period that overlaps the current one joins it.** `_bucket_key` judges each row alone, and a period can start after today and still run *inside* the current one:
+
+```
+current   2024-10-01 -> 2027-06-30    hjem <-> skole
+future    2026-10-05 -> 2027-06-25    klubturene
+```
+
+Left as two bevillinger, the second turns Aktiv on 2026-10-05 while the first still is, and `usp_recalculate_bevilling_status` sets **both** to Fejlet — `Borgeren har mere end én aktiv bevilling` — months after the conversion, with nothing in the run log pointing at it. Overlapping periods cannot be two bevillinger in the new model, so `_buckets_for_case` makes them one. The rows keep their own dates and become separate kørselsrækker, which is what the second period usually is: klub legs added partway through a school year, which the old system could only express by opening another bevilling.
+
+Applied to a **fixed point** — absorbing a row extends the span and can bring another within reach, and that cascade is correct for the same reason the first step is. `past` and `ukendt` are untouched; Udløbet does not collide.
+
+Checked against the source before this went in: no case has more than one distinct `SkoleID` among its overlapping rows, so nothing that converts today starts failing on `rækkerne er uenige`.
+
 Future rows are merged even where their periods are far apart. The legacy data is not detailed enough to split them into meaningful separate bevillinger, and only one may become Aktiv later in any case.
 
 Nothing here assigns a status — the status engine derives Aktiv / Kommende / Udløbet from the kørselsrække dates once the rows exist. The bucketing only decides which rows share a bevilling.

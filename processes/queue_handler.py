@@ -2505,6 +2505,76 @@ def _bucket_key(row: dict, today: date) -> tuple:
     return ("past", fra.isoformat(), til.isoformat())
 
 
+def _buckets_for_case(case_rows: list[dict], today: date) -> list[tuple]:
+    """Bucket a case's rows, absorbing future rows that overlap the current one.
+
+    _bucket_key judges each row on its own, and that leaves a hole the whole
+    bucketing exists to close. A period can start AFTER today and still run
+    INSIDE the current one:
+
+        current   2024-10-01 -> 2027-06-30    hjem <-> skole
+        future    2026-10-05 -> 2027-06-25    klubturene
+
+    Two bevillinger, and on 2026-10-05 the second turns Aktiv while the first
+    still is. usp_recalculate_bevilling_status counts active bevillinger per
+    citizen and sets every one of them to Fejlet with "Borgeren har mere end
+    én aktiv bevilling" — months after the conversion, with nothing in the run
+    log pointing at it.
+
+    Overlapping periods simply cannot be two bevillinger in the new model, so
+    they are made one. The rows keep their own dates: they become separate
+    kørselsrækker under the one bevilling, which is what the second period
+    usually is anyway — klub legs added partway through a school year, which
+    the old system could only express by opening another bevilling.
+
+    Applied to a FIXED POINT, because absorbing a row extends the span and can
+    bring another within reach:
+
+        current 2024-10-01 -> 2027-06-30
+        future  2026-10-05 -> 2027-12-31   overlaps -> absorbed, span now to 2027-12-31
+        future  2027-08-01 -> 2028-06-30   now overlaps too -> absorbed
+
+    That cascade is correct for the same reason the first step is: after the
+    merge the bevilling really does run to 2027-12-31, and anything active
+    inside that window would collide with it.
+
+    past is left alone — Udløbet does not collide — and so is ukendt.
+
+    Returns one bucket key per row, in the order the rows came in.
+    """
+
+    noegler = [_bucket_key(r, today) for r in case_rows]
+    aktuelle = [r for r, k in zip(case_rows, noegler) if k[0] == "current"]
+
+    if not aktuelle:
+        return noegler
+
+    span_fra = min(_as_date(r.get("BevillingFra")) for r in aktuelle)
+    span_til = max(_as_date(r.get("BevillingTil")) for r in aktuelle)
+
+    flyttet = True
+
+    while flyttet:
+        flyttet = False
+
+        for i, (row, noegle) in enumerate(zip(case_rows, noegler)):
+            if noegle[0] != "future":
+                continue
+
+            fra = _as_date(row.get("BevillingFra"))
+            til = _as_date(row.get("BevillingTil"))
+
+            if fra is None or til is None or fra > span_til or til < span_fra:
+                continue
+
+            noegler[i] = ("current",)
+            span_fra = min(span_fra, fra)
+            span_til = max(span_til, til)
+            flyttet = True
+
+    return noegler
+
+
 def retrieve_items_for_queue() -> list[dict]:
     """
     Read befordring rows from [RPA].[rpa].[BefordringsData] and group them
@@ -2656,6 +2726,8 @@ def retrieve_items_for_queue() -> list[dict]:
     omvendte_datoer: set[str] = set()
     noterede_rows = 0
     lukkede_konverteret = 0
+    absorberede_raekker = 0
+    absorberede_sager: set[str] = set()
 
     # groupby only groups CONSECUTIVE equal keys, so both levels sort first.
     # The query orders by CaseID alone, which left the inner grouping at the
@@ -2669,19 +2741,38 @@ def retrieve_items_for_queue() -> list[dict]:
 
         # Within each case, rows are bucketed by when they apply — see
         # _bucket_key for why current and future rows are merged rather than
-        # split by their exact dates.
-        def bucket_of(row):
-            return _bucket_key(row, today)
+        # split by their exact dates, and _buckets_for_case for why a future
+        # period overlapping the current one joins it instead.
+        noegler = _buckets_for_case(case_rows, today)
+        absorberet = sum(
+            1
+            for row, noegle in zip(case_rows, noegler)
+            if noegle[0] == "current" and _bucket_key(row, today)[0] == "future"
+        )
 
-        case_rows = sorted(case_rows, key=lambda r: (bucket_of(r), str(r.get("CaseDBID") or "")))
+        if absorberet:
+            logger.info(
+                "  Sag %s: %d fremtidig(e) række(r) overlapper den aktuelle "
+                "periode og er lagt på SAMME bevilling som kørselsrækker. To "
+                "overlappende bevillinger ville begge blive Fejlet.\n",
+                ppr_case_id,
+                absorberet,
+            )
+            absorberede_raekker += absorberet
+            absorberede_sager.add(str(ppr_case_id))
+
+        parret = sorted(
+            zip(noegler, case_rows),
+            key=lambda p: (p[0], str(p[1].get("CaseDBID") or "")),
+        )
 
         bevillinger = []
         # (bucket, [(kilde, match)]) per bevilling — for the queue log below.
         adresse_log: list[tuple[str, list[tuple[str, str | None]]]] = []
         sag_lukket = str(ppr_case_id).strip() in lukkede_sager
 
-        for bev_key, bev_iter in groupby(case_rows, key=bucket_of):
-            bev_rows = list(bev_iter)
+        for bev_key, bev_iter in groupby(parret, key=lambda p: p[0]):
+            bev_rows = [row for _, row in bev_iter]
             first = bev_rows[0]
 
             # A closed case whose address will not resolve is converted onto
@@ -3084,6 +3175,19 @@ def retrieve_items_for_queue() -> list[dict]:
             byttede_datoer_aabne,
             len(omvendte_datoer),
             "\n".join(f"  {c}" for c in sorted(omvendte_datoer)),
+        )
+
+    if absorberede_raekker:
+        logger.warning(
+            "%d row(s) across %d case(s) had a period starting after today "
+            "but overlapping the student's CURRENT period. They are "
+            "kørselsrækker on the current bevilling rather than a separate "
+            "one: two overlapping bevillinger would both go to Fejlet "
+            "('Borgeren har mere end én aktiv bevilling') on the day the "
+            "second turned Aktiv. Cases: %s\n",
+            absorberede_raekker,
+            len(absorberede_sager),
+            ", ".join(sorted(absorberede_sager)),
         )
 
     if lukkede_konverteret:

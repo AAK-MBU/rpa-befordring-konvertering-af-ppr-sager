@@ -53,6 +53,8 @@ Faserne er uafhængige og kan kombineres.
 
    Grænsen er i dag og kun i dag. En række, der begynder i morgen, er Kommende — ikke aktiv.
 
+   En `future`-periode, der **overlapper** den aktuelle, lægges dog på den aktuelle bevilling som ekstra kørselsrækker. To overlappende bevillinger kan ikke begge findes: den dag den anden bliver Aktiv, sætter `usp_recalculate_bevilling_status` dem begge til Fejlet med *Borgeren har mere end én aktiv bevilling*. Typisk er den anden periode klubkørsel, der er kommet til midt i et skoleår.
+
 ### `--process`
 
 `processes/bevilling_creation.py` kalder API'et i denne rækkefølge:
