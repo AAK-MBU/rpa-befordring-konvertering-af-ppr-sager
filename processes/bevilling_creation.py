@@ -45,6 +45,7 @@ def _fetch_lookup(api_endpoint: str, api_key: str, path: str) -> list[dict]:
 
 
 _MATRIKEL_STED = re.compile(r"\(([^)]+)\)")
+_MATRIKEL_SKOLE = re.compile(r"^([^(]+)")
 
 
 def _uden_accent(value: str | None) -> str:
@@ -92,10 +93,97 @@ def _extend_kommentar(kommentar: str | None, note: str | None) -> str | None:
     return f"{eksisterende}\n\n{note}" if eksisterende else note
 
 
+def _matrikler_andetsteds(
+    skole_par: list,
+    alle_matrikler: list[dict] | None,
+    skolekode: object,
+) -> list[dict]:
+    """Matrikler under a DIFFERENT skolekode that the rows' own columns name.
+
+    A stale SkoleID reads exactly like an unplaceable one: the code's own
+    sites are searched, none of them matches, and the message ends "ingen af
+    dem peger på en afdeling" — which sounds like the address was at fault.
+    Usually it was not. A student changing school has the new school written
+    on the row while SkoleID still holds the old school's code:
+
+        SkoleID               751020                              (Kaløvigskolen)
+        SkoleNavnBefordring   Langagerskolen
+        SkolensAdresse        Kolt Østervej 45, 8361 Hasselager   (751090)
+
+    Searching the whole table for what the row actually names turns that into
+    something a caseworker can act on: the columns are right, the code is
+    wrong, and BefordringsData is what needs correcting.
+
+    For the message only — nothing is resolved from it. The matrikel still
+    has to come from SkoleID, because trusting free text over the code is how
+    a live bevilling ends up at the wrong school.
+
+    Matched on the label, which is all /lookup/skolematrikel returns: the
+    school name before the parenthesis against SkoleNavnBefordring, and the
+    site inside it against SkolensAdresse — so "Langagerskolen" alone finds
+    both Langagerskolen sites and "Kolt Østervej 45" narrows them to one.
+
+    A row that names the school but not the site still counts. Both sites
+    then come back, which is enough: they share a skolekode, and the
+    skolekode is the field being questioned.
+    """
+
+    if not alle_matrikler:
+        return []
+
+    kode = str(skolekode or "").strip()
+    praecise: dict[int, dict] = {}
+    navn_kun: dict[int, dict] = {}
+
+    for par in skole_par or []:
+        adresse, navn = (list(par) + ["", ""])[:2]
+        navn_foldet = _uden_accent(navn)
+
+        if not navn_foldet:
+            continue
+
+        haystack = _uden_accent(adresse) + "\x00" + navn_foldet
+
+        for k in alle_matrikler:
+            if str(k.get("skolekode") or "").strip() == kode:
+                continue
+
+            label = str(k.get("label") or "")
+            skole = _MATRIKEL_SKOLE.match(label)
+            skole_foldet = _uden_accent(skole.group(1) if skole else label)
+
+            if not skole_foldet or skole_foldet not in navn_foldet:
+                continue
+
+            sted = _MATRIKEL_STED.search(label)
+
+            if sted and _uden_accent(sted.group(1)) not in haystack:
+                navn_kun[k["id"]] = k
+                continue
+
+            praecise[k["id"]] = k
+
+    return list((praecise or navn_kun).values())
+
+
+def _forkert_skoleid(andre: list[dict], skolekode: object) -> str:
+    """One sentence naming the skolekode the rows actually describe."""
+
+    navne = ", ".join(sorted(str(k.get("label")) for k in andre))
+    koder = " / ".join(sorted({str(k.get("skolekode")) for k in andre}))
+
+    return (
+        f"SkoleID ser forældet ud: rækkernes skolekolonner peger på {navne} "
+        f"— skolekode {koder}, ikke {skolekode}. Ret SkoleID i "
+        "BefordringsData."
+    )
+
+
 def _vaelg_matrikel(
     kandidater: list[dict],
     skole_par: list,
     bucket: str | None = None,
+    alle_matrikler: list[dict] | None = None,
 ) -> tuple[int | None, str | None]:
     """Which matrikel a bevilling belongs to, when a skolekode has several.
 
@@ -134,6 +222,12 @@ def _vaelg_matrikel(
     bevillinger, and a wrong school there drives the walking distance, the
     skolekode comparison and the school derivation on Elev.
 
+    Where nothing matches, the whole table is searched for what the rows DO
+    name, so a stale SkoleID — the new school written on the row, the old
+    school's code still in the column — is stated as such instead of reading
+    like a bad address. It only sharpens the message; the site is never
+    resolved from it. See _matrikler_andetsteds.
+
     Returns (matrikel_id, note). The note is None unless a guess was made.
     An unknown skolekode yields (None, None), exactly as before.
     """
@@ -159,6 +253,11 @@ def _vaelg_matrikel(
     if len(fundet) == 1:
         return next(iter(fundet)), None
 
+    andre = _matrikler_andetsteds(
+        skole_par, alle_matrikler, kandidater[0].get("skolekode")
+    )
+    hint = _forkert_skoleid(andre, kandidater[0].get("skolekode")) if andre else ""
+
     proevet = "; ".join(
         f"{(list(p) + ['', ''])[0]!r} / {(list(p) + ['', ''])[1]!r}"
         for p in skole_par or []
@@ -173,7 +272,7 @@ def _vaelg_matrikel(
             f"Skolekode {kandidater[0].get('skolekode')} dækker flere "
             f"afdelinger: {', '.join(str(k.get('label')) for k in kandidater)}.",
             f"Rækkernes SkolensAdresse / SkoleNavnBefordring: {proevet}",
-            "Ingen af dem peger entydigt på en afdeling.",
+            hint or "Ingen af dem peger entydigt på en afdeling.",
             f"Valgt: {valgt.get('label')}",
             "Bevillingen er udløbet, så afdelingen har ingen praktisk "
             "betydning — men ret den, hvis den skal være rigtig.",
@@ -190,10 +289,14 @@ def _vaelg_matrikel(
             f"De peger på flere forskellige afdelinger ({', '.join(fundet.values())}) "
             "— rækkerne er uenige."
             if fundet
-            else "Ingen af dem peger på en afdeling."
+            else hint or "Ingen af dem peger på en afdeling."
         )
-        + " Kan ikke afgøre hvilken afdeling bevillingen hører til — "
-        "kræver manuel opfølgning."
+        + (
+            " Kan ikke afgøre hvilken afdeling bevillingen hører til — "
+            "kræver manuel opfølgning."
+            if not hint
+            else ""
+        )
     )
 
 
@@ -779,6 +882,7 @@ def create_bevilling(
             # bevilling-level pair so they still convert.
             or [[bevilling.get("SkolensAdresse"), bevilling.get("SkoleNavnBefordring")]],
             bevilling.get("bucket"),
+            skolematrikler,
         )
 
         if matrikel_note:
