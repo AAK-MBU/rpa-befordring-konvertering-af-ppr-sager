@@ -29,6 +29,13 @@ def process_item(item_data: dict, item_reference: str):
                                          adresse_id is the fallback and what
                                          the check below tests.
                                        koerselsraekker (list[dict])
+        lois_person  (dict | None) -- What LOIS.CPR.PersonGeoView holds for
+                                     this CPR: adresse_id, adresseringsnavn,
+                                     navne_adresse_beskyttelse. Only used when
+                                     the student is missing from Elev, which
+                                     happens for a student outside the
+                                     folkeskole — the nightly load covers
+                                     folkeskole pupils only.
     """
 
     ppr_case_id = item_data.get("ppr_case_id", "")
@@ -68,4 +75,5 @@ def process_item(item_data: dict, item_reference: str):
         ppr_case_id=ppr_case_id,
         person_ssn=person_ssn,
         bevillinger=bevillinger,
+        lois_person=item_data.get("lois_person"),
     )

@@ -675,31 +675,35 @@ def _cpr_cifre(cpr) -> str:
     return cifre if len(cifre) == 10 else ""
 
 
-def _lois_adresser(cprs: list[str]) -> dict[str, str]:
-    """cpr -> adresse_id from LOIS.CPR.PersonGeoView. Empty dict when unavailable.
+def _lois_personer(cprs: list[str]) -> dict[str, dict]:
+    """cpr -> what LOIS knows about the person. Empty dict when unavailable.
 
     The same view and the same key (PNR_0, ten digits, no dash) that
     rpa-befordring-nightly-runs uses to resolve Elev.adresse_id every night.
-    Where a legacy address cannot be matched, this says where CPR thinks the
-    student actually lives — which is the correction a caseworker would
-    otherwise have to look up by hand, one student at a time.
 
-    Diagnostic only. Every failure is swallowed, including the env var being
-    unset: no LOIS means one missing hint in a warning, never a failed
-    conversion.
+    Two jobs. For a student whose legacy address will not match, it says where
+    CPR thinks they actually live — the correction a caseworker would
+    otherwise look up by hand, one student at a time. And for a student the
+    nightly load has never heard of, it is everything needed to create them:
+    LOIS covers every citizen of the municipality, while Elev_STG covers only
+    folkeskole pupils, so a gymnasieelev on midlertidig kørsel is in the one
+    and not the other. See _opret_elev_fra_lois in bevilling_creation.
 
-    Chunked at 900 for the same reason the nightly run chunks: SQL Server caps
-    a statement at 2100 parameters.
+    Per CPR:
+
+        adresse_id                  AdresseId, the DAR GUID — the same key the
+                                    Adresse table uses, so it needs no
+                                    translation
+        adresseringsnavn            Adresseringsnavn, the register's own
+                                    single-field spelling of the name
+        navne_adresse_beskyttelse   Beskyttelseskode = 1
+
+    Every failure is swallowed, including the env var being unset. Chunked at
+    900 for the same reason the nightly run chunks: SQL Server caps a
+    statement at 2100 parameters.
     """
 
     if not CONN_STRING_SERVER29:
-        logger.warning(
-            "DBCONNECTIONSTRINGSERVER29 is not set, so the unresolved "
-            "addresses below cannot say where CPR has these students living. "
-            "Set it to the same value rpa-befordring-nightly-runs uses. The "
-            "conversion is unaffected.\n"
-        )
-
         return {}
 
     rene = sorted({cifre for cifre in map(_cpr_cifre, cprs) if cifre})
@@ -707,7 +711,7 @@ def _lois_adresser(cprs: list[str]) -> dict[str, str]:
     if not rene:
         return {}
 
-    fundet: dict[str, str] = {}
+    fundet: dict[str, dict] = {}
 
     try:
         with pyodbc.connect(CONN_STRING_SERVER29) as conn:
@@ -719,28 +723,56 @@ def _lois_adresser(cprs: list[str]) -> dict[str, str]:
 
                 cursor.execute(
                     f"""
-                    SELECT [PNR_0], CONVERT(NVARCHAR(36), [AdresseId])
+                    SELECT [PNR_0],
+                           CONVERT(NVARCHAR(36), [AdresseId]),
+                           [Adresseringsnavn],
+                           [Beskyttelseskode]
                     FROM   [LOIS].[CPR].[PersonGeoView]
                     WHERE  [PNR_0] IN ({placeholders})
-                    AND    [AdresseId] IS NOT NULL
                     """,
                     chunk,
                 )
 
-                for cpr, adresse_id in cursor.fetchall():
-                    if cpr and adresse_id:
-                        fundet[str(cpr).strip()] = str(adresse_id).strip()
+                for cpr, adresse_id, navn, beskyttelse in cursor.fetchall():
+                    if not cpr:
+                        continue
+
+                    fundet[str(cpr).strip()] = {
+                        "adresse_id": str(adresse_id).strip() if adresse_id else None,
+                        "adresseringsnavn": str(navn).strip() if navn else None,
+                        "navne_adresse_beskyttelse": str(beskyttelse or "").strip() == "1",
+                    }
     except pyodbc.Error as exc:
         logger.warning(
-            "Could not read LOIS.CPR.PersonGeoView for the unresolved "
-            "addresses, so the log cannot show where CPR has these students "
-            "living. The conversion is unaffected. %s\n",
+            "Could not read LOIS.CPR.PersonGeoView. The log cannot show where "
+            "CPR has these students living, and a student missing from Elev "
+            "cannot be created from LOIS. %s\n",
             exc,
         )
 
         return {}
 
     return fundet
+
+
+def _lois_adresser(cprs: list[str]) -> dict[str, str]:
+    """cpr -> adresse_id from LOIS. Diagnostic; empty dict when unavailable."""
+
+    if not CONN_STRING_SERVER29:
+        logger.warning(
+            "DBCONNECTIONSTRINGSERVER29 is not set, so the unresolved "
+            "addresses below cannot say where CPR has these students living. "
+            "Set it to the same value rpa-befordring-nightly-runs uses. The "
+            "conversion is unaffected.\n"
+        )
+
+        return {}
+
+    return {
+        cpr: person["adresse_id"]
+        for cpr, person in _lois_personer(cprs).items()
+        if person["adresse_id"]
+    }
 
 
 def _adresse_tekst(api_endpoint: str, headers: dict, adresse_id: str) -> str | None:
@@ -2695,6 +2727,27 @@ def retrieve_items_for_queue() -> list[dict]:
             len(elev_adresse),
         )
 
+    # What LOIS knows about every student in the run, carried on the item so
+    # the process phase can create an Elev row for anyone the nightly load has
+    # never heard of. LOIS covers every citizen of the municipality; Elev_STG
+    # covers folkeskole pupils only, so a gymnasieelev on midlertidig kørsel
+    # is in the one and not the other. One batched query for the whole run.
+    lois_personer = _lois_personer([str(r.get("CPR") or "") for r in rows])
+
+    if lois_personer:
+        logger.info(
+            "LOIS knows %d of the run's students. A student missing from Elev "
+            "is created from that rather than rejected.\n",
+            len(lois_personer),
+        )
+    elif not CONN_STRING_SERVER29:
+        logger.warning(
+            "DBCONNECTIONSTRINGSERVER29 is not set, so a student the nightly "
+            "load does not know cannot be created from LOIS and the case will "
+            "be rejected. Set it to the same value "
+            "rpa-befordring-nightly-runs uses.\n"
+        )
+
     today = date.today()
 
     logger.info(
@@ -3093,6 +3146,8 @@ def retrieve_items_for_queue() -> list[dict]:
                 "ppr_case_id": ppr_case_id,
                 "person_ssn": person_ssn,
                 "bevillinger": bevillinger,
+                # Only consulted when the student is missing from Elev.
+                "lois_person": lois_personer.get(_cpr_cifre(person_ssn)),
             },
         })
 

@@ -387,6 +387,26 @@ Every currently enrolled student is already in `Elev`: `rpa-befordring-nightly-r
 
 This bot used to `POST /citizen/create_elev` with just `{cpr, adresse_id}`. That produced a row with no name, no `skolekode` and no `elevklassetrin`, which nothing would ever fill in: the nightly upsert only touches CPRs present in `Elev_STG`, and this one is not. It would also sit outside the school derivation permanently, because `usp_sync_elev_matrikel_from_bevilling` requires a non-zero `skolekode` before it will take a matrikel from the bevilling — and no school means no walking distance either.
 
+**Since then it creates them from LOIS instead.** `Elev` is loaded from `Elev_STG`, which holds folkeskole pupils; `LOIS.CPR.PersonGeoView` holds every citizen of the municipality. A student on **midlertidig kørsel to an ungdomsuddannelse** was never in the first and is still in the second, so rejecting the case threw away a conversion the data plainly supported.
+
+The queue phase reads LOIS once for the whole run (`_lois_personer`) and carries `lois_person` on each item. When `GET /citizen/stamdata/{cpr}` comes back empty, `_opret_elev_fra_lois` writes everything LOIS knows and leaves the rest at values that mean *unknown* rather than filling them with guesses:
+
+| field | source |
+|---|---|
+| `adresseringsnavn` | LOIS |
+| `navne_adresse_beskyttelse` | LOIS `Beskyttelseskode = 1` |
+| `adresse_id` | LOIS `AdresseId`, falling back to the bevilling's own address when that GUID is not a row in `Adresse` |
+| `skolekode` | `SkoleID` from BefordringsData when it reads as a number, else `0` |
+| `klasseart`, `elevklassetrin`, `klassebetegnelse`, `institution`, `bopaelsdistrikt` | `""` — nobody holds these for a student outside the folkeskole |
+| `skoleafstand`, `matrikel_id`, `ungdomsuddannelse_id` | NULL |
+| `kraever_genberegning` | `False` — a walking distance needs a school at one end |
+
+The difference from the old shell is that **this is not a row waiting to be filled in**. A skolekode of `0` deliberately keeps them out of the school derivation, which is correct: `usp_sync_elev_matrikel_from_bevilling` requires a non-zero skolekode before taking a folkeskole matrikel from a bevilling, and this student does not attend one. Where the bevilling names an ungdomsuddannelse, that procedure derives `ungdomsuddannelse_id` from the bevilling on its own.
+
+Every kørselsrække on such a case carries a `KONVERTERING-PPR | eleven er oprettet ud fra folkeregisteret` comment naming what was taken from LOIS, which skolekode was used, and which fields were left blank. This is the thinnest conversion the bot performs, and the fields it could not fill are exactly the ones a caseworker must supply — so the case lands in the same `KONVERTERING-PPR` list as everything else rather than waiting to be noticed. It stacks with the matrikel note where both apply.
+
+A CPR in neither Elev nor LOIS is still a `BusinessError` — that is a person the municipality has no record of at all. `DBCONNECTIONSTRINGSERVER29` unset means no LOIS and therefore no fallback; the queue phase warns about it up front.
+
 So a miss now raises `BusinessError`, which sends the item to `pending_user` rather than failing it. Nothing the bot can do resolves it; a person has to decide whether that student should be converted at all.
 
 ### Every conversion comment is marked

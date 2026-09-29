@@ -651,10 +651,207 @@ def _has_koerselsraekker(api_endpoint: str, headers: dict, bevilling_id: int) ->
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _adresse_findes(api_endpoint: str, headers: dict, adresse_id: str) -> bool:
+    """Is this adresse_id already a row in Adresse? False on any doubt."""
+
+    try:
+        response = requests.get(
+            f"{api_endpoint}/adresse/{adresse_id}",
+            headers=headers,
+            timeout=30,
+        )
+    except requests.RequestException:
+        return False
+
+    return bool(response.ok and response.json())
+
+
+def _cpr_cifre(cpr) -> str:
+    """The ten digits of a CPR. Elev.cpr is CHAR(10), the source is not."""
+
+    return "".join(c for c in str(cpr or "") if c.isdigit())
+
+
+def _skolekode_fra_rows(bevillinger: list[dict]) -> int:
+    """The first SkoleID that reads as a number, else 0."""
+
+    for bevilling in bevillinger:
+        raa = str(bevilling.get("SkoleID") or "").strip()
+
+        if raa.isdigit():
+            return int(raa)
+
+    return 0
+
+
+def _adresse_id_kilde_tekst(kilde: str) -> str:
+    """The note's wording for where the address came from."""
+
+    return (
+        "adressen er folkeregisterets"
+        if kilde == "LOIS"
+        else "adressen er taget fra bevillingen, da folkeregisterets adresse "
+        "ikke findes i adressetabellen"
+    )
+
+
+def _opret_elev_fra_lois(
+    api_endpoint: str,
+    headers: dict,
+    person_ssn: str,
+    ppr_case_id: str,
+    lois_person: dict | None,
+    bevillinger: list[dict],
+) -> tuple[str, str]:
+    """Create the student in Elev from LOIS. Returns (adresse_id, note).
+
+    Elev is loaded nightly from Elev_STG, which holds folkeskole pupils. A
+    student on midlertidig kørsel to an ungdomsuddannelse was never in it, so
+    the conversion used to reject the case — even though the municipality
+    plainly knows the person: LOIS.CPR.PersonGeoView covers every citizen.
+
+    What the earlier attempt got wrong was creating a SHELL: {cpr, adresse_id}
+    and nothing else, a row no later process would ever fill in. This is the
+    opposite — everything LOIS actually knows is written, and the fields it
+    cannot know are left at the values that mean "unknown" rather than filled
+    with guesses:
+
+        adresseringsnavn            LOIS
+        navne_adresse_beskyttelse   LOIS Beskyttelseskode = 1
+        adresse_id                  LOIS, or the bevilling's own address when
+                                    the register row is not in Adresse
+        skolekode                   BefordringsData SkoleID, else 0
+        matrikel_id                 left NULL — the API defaults it
+        ungdomsuddannelse_id        not settable here; usp_sync_elev_matrikel_
+                                    from_bevilling derives it from the
+                                    bevilling
+        klasseart, elevklassetrin,
+        klassebetegnelse,
+        institution,
+        bopaelsdistrikt             "" — the school data nobody has for a
+                                    student outside the folkeskole
+        skoleafstand                NULL — no school, nothing to measure to
+        kraever_genberegning        False — a walking distance needs a school
+                                    at one end, and there is none
+
+    A skolekode of 0 keeps them out of the school derivation, which is
+    correct: usp_sync_elev_matrikel_from_bevilling requires a non-zero
+    skolekode before it will take a folkeskole matrikel from a bevilling, and
+    this student does not attend one.
+
+    Without a LOIS row there is nothing to build from, and the case is still
+    rejected — that is a person the municipality has no record of at all.
+
+    The note goes on every kørselsrække of every bevilling on the case. This
+    is the thinnest conversion the bot performs — a student built from a
+    person register rather than a school register — and the fields it could
+    not fill are exactly the ones a caseworker needs to supply. Saying so on
+    the rows puts the case in the same KONVERTERING-PPR list as the rest
+    instead of leaving it to be noticed.
+    """
+
+    if not lois_person:
+        raise BusinessError(
+            f"Student {person_ssn} (PPR case {ppr_case_id}) is in neither "
+            "Elev nor LOIS.CPR.PersonGeoView. The nightly student load does "
+            "not know this CPR, and neither does the municipality's own "
+            "person register — they have most likely moved away. Needs "
+            "manual review before the bevilling can be converted."
+        )
+
+    lois_adresse_id = str(lois_person.get("adresse_id") or "").strip()
+    bevilling_adresse_id = next(
+        (
+            str(b.get("adresse_id")).strip()
+            for b in bevillinger
+            if b.get("adresse_id")
+        ),
+        "",
+    )
+
+    # LOIS says where they live NOW, which is what Elev.adresse_id means. The
+    # bevilling's own address is the fallback: it is historical, but it is
+    # guaranteed to be a row in Adresse because the queue phase resolved it
+    # against that very table.
+    adresse_id = lois_adresse_id or bevilling_adresse_id
+    kilde = "LOIS"
+
+    if lois_adresse_id and not _adresse_findes(api_endpoint, headers, lois_adresse_id):
+        adresse_id = bevilling_adresse_id
+        kilde = "bevillingens egen adresse (LOIS-adressen findes ikke i Adresse)"
+
+    if not adresse_id:
+        raise BusinessError(
+            f"Student {person_ssn} (PPR case {ppr_case_id}) is not in Elev, "
+            "and neither LOIS nor the bevilling supplies an address to "
+            "create them with — POST /citizen/create_elev requires one. "
+            "Needs manual review."
+        )
+
+    payload = {
+        "cpr": _cpr_cifre(person_ssn),
+        "adresseringsnavn": lois_person.get("adresseringsnavn"),
+        "adresse_id": adresse_id,
+        "navne_adresse_beskyttelse": bool(
+            lois_person.get("navne_adresse_beskyttelse")
+        ),
+        "skolekode": _skolekode_fra_rows(bevillinger),
+    }
+
+    response = requests.post(
+        f"{api_endpoint}/citizen/create_elev",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+
+    if not response.ok:
+        raise ProcessError(
+            f"Failed to create Elev for {person_ssn} (PPR case {ppr_case_id}) "
+            f"from LOIS: {response.status_code} — {response.text}"
+        )
+
+    logger.warning(
+        "  Student %s (PPR case %s) was not in Elev and has been created "
+        "from LOIS: navn %r, adresse_id %s (%s), skolekode %s. Klassetrin, "
+        "klasseart and institution are blank — LOIS does not hold them, and "
+        "the nightly load will not fill them in for a student outside the "
+        "folkeskole.\n",
+        person_ssn,
+        ppr_case_id,
+        payload["adresseringsnavn"] or "(ukendt)",
+        adresse_id,
+        kilde,
+        payload["skolekode"],
+    )
+
+    note = _konverterings_note(
+        "eleven er oprettet ud fra folkeregisteret",
+        "Eleven fandtes ikke i elevdata, fordi det natlige elevtræk kun "
+        "dækker folkeskolen. Bevillingen er derfor konverteret på grundlag "
+        "af folkeregisteret (LOIS).",
+        f"Hentet derfra: navn og adresse ({_adresse_id_kilde_tekst(kilde)}).",
+        "Skolekode: "
+        + (
+            str(payload["skolekode"])
+            + " fra de gamle data."
+            if payload["skolekode"]
+            else "ingen — de gamle data oplyste ingen brugbar skolekode."
+        ),
+        "Klassetrin, klasseart, klassebetegnelse, institution og "
+        "bopælsdistrikt står tomme, og skoleafstand er ikke beregnet. De "
+        "oplysninger findes ingen steder for en elev uden for folkeskolen.",
+        "Gennemgå bevillingen, og udfyld det, der mangler.",
+    )
+
+    return adresse_id, note
+
+
 def create_bevilling(
     ppr_case_id: str,
     person_ssn: str,
     bevillinger: list[dict],
+    lois_person: dict | None = None,
 ) -> None:
     """
     Creates bevilling and koerselsraekke records via the API for a student
@@ -820,27 +1017,32 @@ def create_bevilling(
         # before it will take a matrikel from the bevilling. No school means no
         # walking distance either.
         #
-        # BusinessError rather than ProcessError: the item goes to
-        # pending_user, so the case is parked for a human rather than failed
-        # and retried. Nothing here can resolve it.
-        raise BusinessError(
-            f"Student {person_ssn} (PPR case {ppr_case_id}) is not in Elev. "
-            "The nightly student load does not know this CPR — they may have "
-            "left the municipality or finished school. Needs manual review "
-            "before the bevilling can be converted."
+        # ... but the municipality still knows them. LOIS.CPR.PersonGeoView
+        # covers every citizen, so the student is created from that instead of
+        # the case being rejected. Only a person LOIS has never heard of is
+        # still a BusinessError — see _opret_elev_fra_lois.
+        elev_adresse_id, elev_note = _opret_elev_fra_lois(
+            api_endpoint,
+            headers,
+            person_ssn,
+            ppr_case_id,
+            lois_person,
+            bevillinger,
         )
+    else:
+        elev_note = None
+        # Where the student lives now, per the nightly Elev load. Every
+        # converted bevilling's address is checked against this — see the
+        # candidate pick in the loop below. None when the nightly run has not
+        # resolved an address for them yet, which switches the check off
+        # rather than failing the case.
+        elev_adresse_id = stamdata.get("adresse_id")
 
-    # Where the student lives now, per the nightly Elev load. Every converted
-    # bevilling's address is checked against this — see the candidate pick in
-    # the loop below. None when the nightly run has not resolved an address for
-    # them yet, which switches the check off rather than failing the case.
-    elev_adresse_id = stamdata.get("adresse_id")
-
-    logger.info(
-        "Student %s exists in Elev. Current adresse_id: %s\n",
-        person_ssn,
-        elev_adresse_id or "(ingen)",
-    )
+        logger.info(
+            "Student %s exists in Elev. Current adresse_id: %s\n",
+            person_ssn,
+            elev_adresse_id or "(ingen)",
+        )
 
     # --- Fetch existing bevillinger for this student to avoid duplicates ---
     # Keyed on (esdh_noegle, foerste_koersel_dato), not esdh_noegle alone.
@@ -1125,7 +1327,10 @@ def create_bevilling(
                 "befordringstype_id": befordringstype_id,
                 "rutetype_id": rutetype_id,
                 "bevilget_koereafstand_pr_vej": kr.get("BevilgetKoereAfstand") or None,
-                "kommentar": _extend_kommentar(kr.get("Kommentar"), matrikel_note),
+                "kommentar": _extend_kommentar(
+                    _extend_kommentar(kr.get("Kommentar"), matrikel_note),
+                    elev_note,
+                ),
                 "dag_ids": [alle_dage_id],
                 "tillaeg_ids": tillaeg_ids,
             }
