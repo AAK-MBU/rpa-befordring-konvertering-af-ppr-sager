@@ -530,18 +530,16 @@ _HJEMMEL_MAPPING: dict[str, dict[str, str]] = {
 }
 
 
-# Every converted bevilling is assigned to this caseworker.
+# The caseworker comes from BefordringsData's Author column, which holds the
+# person who wrote the row: a full name followed by something in brackets —
+# "Anne Sørensen (BU Befordring)". The bracketed part is an organisational
+# label, not part of the name, and is dropped.
 #
-# BefordringsData has a Sagsbehandler column, but the names in it are legacy
-# PPR staff and do not line up with the Sagsbehandler table — which is not
-# seeded reference data but real people, created and retired as staff change.
-# Matching on those names would leave most converted bevillinger with no
-# caseworker at all, and occasionally attach one to someone who has left.
-#
-# A single known owner is more useful: every converted bevilling is
-# identifiable and reassignable in one go. Change this when the business
-# decides who should own them.
-_SAGSBEHANDLER_NAVN = "Sofie"
+# Every converted bevilling used to be assigned to one hardcoded owner
+# instead, on the grounds that the legacy names would not line up with the
+# Sagsbehandler table. Author does line up, and it says who actually handled
+# the case — which is worth more than a single reassignable owner.
+_FORFATTER_PARENTES = re.compile(r"\s*[(\[][^)\]]*[)\]]\s*")
 
 
 # BefordringsData has no rutetype — the new system does, and its own form
@@ -650,6 +648,121 @@ def _has_koerselsraekker(api_endpoint: str, headers: dict, bevilling_id: int) ->
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def _navn_fold(value: str | None) -> str:
+    """Fold a person's name for comparison, KEEPING the spaces.
+
+    _uden_accent cannot be used here: it removes all whitespace, which is
+    right for a lookup label but destroys the word boundaries this match
+    depends on — "Sofie Hansen" would collapse to "sofiehansen", and the
+    label "Sofie" would no longer end on a boundary.
+
+    Case folded, æ/ø/å flattened to ae/oe/aa, remaining accents stripped, and
+    runs of whitespace collapsed to one space.
+    """
+
+    foldet = str(value or "").casefold()
+
+    for saerlig, almindelig in (("æ", "ae"), ("ø", "oe"), ("å", "aa")):
+        foldet = foldet.replace(saerlig, almindelig)
+
+    nedbrudt = unicodedata.normalize("NFD", foldet)
+    uden_accent = "".join(c for c in nedbrudt if not unicodedata.combining(c))
+
+    return " ".join(uden_accent.split())
+
+
+def _forfatter_navn(author: str | None) -> str:
+    """The person's name from an Author value, without the bracketed part."""
+
+    return " ".join(_FORFATTER_PARENTES.sub(" ", str(author or "")).split())
+
+
+def _vaelg_sagsbehandler(
+    author: str | None,
+    sagsbehandlere: list[dict],
+    ppr_case_id: str,
+) -> int:
+    """The Sagsbehandler id for a row's Author. Raises when it cannot be told.
+
+    Matched on the folded name — case, spacing and accents ignored, and æ/ø/å
+    flattened — because the two systems do not spell staff names identically
+    and a caseworker is not going to be re-typed to make them agree.
+
+    Three passes, narrowest first:
+
+      1. the whole name equals the label
+      2. the label is one or more whole words at the START of the name —
+         "Sofie" matches "Sofie Hansen", because the table has historically
+         held first names while Author holds the full one
+      3. the label appears as whole words anywhere in the name
+
+    A pass that finds EXACTLY ONE label wins. Two labels matching equally well
+    is not a tie to break: "Anne" and "Anne Marie" are different people, and
+    guessing between them puts a case on the wrong caseworker's list.
+
+    BusinessError rather than a fallback owner. The case goes to pending_user
+    with the name quoted, so it is fixed by adding the person to the
+    Sagsbehandler table or correcting the row — both of which are right, where
+    silently parking it on a stand-in is not.
+    """
+
+    navn = _navn_fold(_forfatter_navn(author))
+
+    if not navn:
+        raise BusinessError(
+            f"PPR case {ppr_case_id}: BefordringsData has no Author on the "
+            "row, so the bevilling has no caseworker to be assigned to. "
+            "Needs manual follow-up."
+        )
+
+    kandidater = [
+        (s, _navn_fold(s.get("label")))
+        for s in sagsbehandlere
+        if str(s.get("label") or "").strip()
+    ]
+
+    def _hele_ord(hay: str, naal: str, kun_start: bool) -> bool:
+        start = hay.find(naal)
+
+        while start != -1:
+            foer_ok = start == 0
+            efter = start + len(naal)
+            efter_ok = efter == len(hay) or not hay[efter].isalpha()
+
+            if efter_ok and (foer_ok or (not kun_start and not hay[start - 1].isalpha())):
+                return True
+
+            start = hay.find(naal, start + 1)
+
+        return False
+
+    for test in (
+        lambda label: label == navn,
+        lambda label: _hele_ord(navn, label, kun_start=True),
+        lambda label: _hele_ord(navn, label, kun_start=False),
+    ):
+        traf = [s for s, label in kandidater if label and test(label)]
+
+        if len(traf) == 1:
+            return traf[0]["id"]
+
+        if len(traf) > 1:
+            raise BusinessError(
+                f"PPR case {ppr_case_id}: Author "
+                f"{_forfatter_navn(author)!r} matches several sagsbehandlere "
+                f"({', '.join(sorted(str(s.get('label')) for s in traf))}). "
+                "Cannot tell which one, and guessing would put the case on "
+                "the wrong caseworker's list. Needs manual follow-up."
+            )
+
+    raise BusinessError(
+        f"PPR case {ppr_case_id}: Author {_forfatter_navn(author)!r} is not "
+        "in the Sagsbehandler table, so the bevilling has no caseworker. "
+        "Add the person to that table, or correct the row. Needs manual "
+        "follow-up."
+    )
+
 
 def _adresse_findes(api_endpoint: str, headers: dict, adresse_id: str) -> bool:
     """Is this adresse_id already a row in Adresse? False on any doubt."""
@@ -896,15 +1009,14 @@ def create_bevilling(
     # "Egen befordring", and that is worth seeing rather than silently fixing.
     tidspunkt_labels = _build_label_map(tidspunkter, name_key="label")
     koerselstype_labels = _build_label_map(koerselstyper, name_key="label")
-    sagsbehandler_map = _build_lookup_map(sagsbehandlere, name_key="label", id_key="id")
-
-    sagsbehandler_id = sagsbehandler_map.get(_normalise(_SAGSBEHANDLER_NAVN))
-
-    if sagsbehandler_id is None:
+    # Real staff, not seeded reference data — so an empty table is a
+    # deployment problem, not a data problem, and it would otherwise surface
+    # as every single case failing on its Author.
+    if not sagsbehandlere:
         raise ProcessError(
-            f"No sagsbehandler named {_SAGSBEHANDLER_NAVN!r} in the "
-            "Sagsbehandler table. That table holds real staff and is not "
-            "seeded, so it has to be populated before a conversion runs."
+            "The Sagsbehandler table is empty. It holds real staff and is "
+            "not seeded, so it has to be populated before a conversion runs "
+            "— every bevilling takes its caseworker from the row's Author."
         )
 
     # Plain name → id map for the DB hjemmel table
@@ -1346,7 +1458,12 @@ def create_bevilling(
             "adresse_id": adresse_id,
             "matrikel_id": matrikel_id,
             "hjemmel_id": hjemmel_id,
-            "sagsbehandler_id": sagsbehandler_id,
+            # From this bevilling's own Author, not one owner for the whole
+            # run: the column is bevilling-level, and two bevillinger on one
+            # case can have been written by different people.
+            "sagsbehandler_id": _vaelg_sagsbehandler(
+                bevilling.get("Author"), sagsbehandlere, ppr_case_id
+            ),
             # The PPR case id. There is no separate ESDH case to resolve —
             # the borgersag flow this bot once had was scrapped, so the source
             # case id is the reference that goes on the bevilling.
