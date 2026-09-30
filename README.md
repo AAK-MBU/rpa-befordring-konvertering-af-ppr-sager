@@ -172,8 +172,8 @@ Kun vellykkede opslag gemmes; fejl prøves igen hver gang. Filen skrives løbend
 |---|---|
 | `ATS_URL`, `ATS_TOKEN` | Automation Server-køen |
 | `ATS_WORKQUEUE_OVERRIDE` | Overskriv workqueue-id (dev/test) |
-| `API_ENDPOINT` | Base-URL på befordrings-API'et |
-| `API_KEY` | Sendes som `X-API-Key`. Skal matche en hash i miljøets `API_KEY_HASHES` |
+| `BEFORDRING_API_ENDPOINT` | Base-URL på befordrings-API'et |
+| `BEFORDRING_API_KEY` | Sendes som `X-API-Key`. Skal matche en hash i miljøets `API_KEY_HASHES` |
 | `DBCONNECTIONSTRINGSERVER29` | LOIS, kun læsning. Samme variabel og samme værdi som i `rpa-befordring-nightly-runs`. **Valgfri** — bruges kun til at vise, hvor CPR har eleven boende, når en adresse ikke kunne slås op. Er den ikke sat, mangler den ene linje i advarslen, og ellers ændrer intet sig |
 
 Forbindelsen til RPA-databasen (`BefordringsData`) er **ikke** en miljøvariabel — den hentes fra `RPAConnection` under kørsel. `DBCONNECTIONSTRINGSERVER29` er en anden forbindelse til en anden server.

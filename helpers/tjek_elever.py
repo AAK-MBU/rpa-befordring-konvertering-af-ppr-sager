@@ -31,7 +31,7 @@ separately rather than as one "known" flag.
 
 Environment: DBCONNECTIONSTRINGSERVER29 for LOIS and RPAConnection for
 BefordringsData, both as the conversion uses them. For the Elev check,
-either DBCONNECTIONSTRINGBEFORDRING (fast) or API_ENDPOINT + API_KEY (slow
+either DBCONNECTIONSTRINGBEFORDRING (fast) or BEFORDRING_API_ENDPOINT + BEFORDRING_API_KEY (slow
 fallback); --api forces the latter.
 """
 
@@ -235,11 +235,11 @@ def _elev_status(cprs: list[str], workers: int = 8) -> dict[str, bool]:
     blip cannot be read as "this student does not exist".
     """
 
-    api_endpoint = os.getenv("API_ENDPOINT", "")
-    api_key = os.getenv("API_KEY", "")
+    api_endpoint = os.getenv("BEFORDRING_API_ENDPOINT", "")
+    api_key = os.getenv("BEFORDRING_API_KEY", "")
 
     if not api_endpoint or not api_key:
-        raise SystemExit("API_ENDPOINT and API_KEY must be set in the environment.")
+        raise SystemExit("BEFORDRING_API_ENDPOINT and BEFORDRING_API_KEY must be set in the environment.")
 
     headers = {"X-API-Key": api_key}
     session = requests.Session()

@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 def get_api_credentials() -> tuple[str, str]:
     """Read befordring API endpoint and key from environment variables."""
-    api_endpoint = os.getenv("API_ENDPOINT", "")
-    api_key = os.getenv("API_KEY", "")
+    api_endpoint = os.getenv("BEFORDRING_API_ENDPOINT", "")
+    api_key = os.getenv("BEFORDRING_API_KEY", "")
     if not api_endpoint or not api_key:
-        raise ProcessError("API_ENDPOINT and API_KEY must be set in the environment / .env file.")
+        raise ProcessError("BEFORDRING_API_ENDPOINT and BEFORDRING_API_KEY must be set in the environment / .env file.")
     return api_endpoint, api_key
 
 

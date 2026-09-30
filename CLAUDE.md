@@ -61,7 +61,7 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 4. Per bevilling: `POST /bevilling/create_bevilling/{cpr}`.
 5. Per kørselsrække: `POST /bevilling/create_koerselsraekke/{bevilling_id}`.
 
-Every call authenticates with `X-API-Key` from `API_KEY`.
+Every call authenticates with `X-API-Key` from `BEFORDRING_API_KEY`.
 
 ### Schools split across two sites
 
@@ -143,8 +143,8 @@ The optional `skolekode` matters on a case with two bevillinger at two different
 |---|---|
 | `ATS_URL`, `ATS_TOKEN` | Automation Server workqueue |
 | `ATS_WORKQUEUE_OVERRIDE` | Override the workqueue id (dev/test) |
-| `API_ENDPOINT` | Base URL of the befordring API |
-| `API_KEY` | Sent as `X-API-Key`. Must match a hash in the target environment's `API_KEY_HASHES` — see that repo's `.env.example` |
+| `BEFORDRING_API_ENDPOINT` | Base URL of the befordring API |
+| `BEFORDRING_API_KEY` | Sent as `X-API-Key`. Must match a hash in the target environment's `API_KEY_HASHES` — see that repo's `.env.example` |
 | `DBCONNECTIONSTRINGSERVER29` | LOIS, read only. Same variable and same value as `rpa-befordring-nightly-runs`. **Optional** — used only to tell an unresolved address where CPR has that student living; unset, that one line is missing from the warning and nothing else changes |
 
 The connection to the RPA database (`BefordringsData`) is **not** an env var; it is fetched at runtime from `RPAConnection`. `DBCONNECTIONSTRINGSERVER29` is separate and points at a different server.
