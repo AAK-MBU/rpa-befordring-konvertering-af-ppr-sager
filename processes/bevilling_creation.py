@@ -678,12 +678,15 @@ def _forfatter_navn(author: str | None) -> str:
     return " ".join(_FORFATTER_PARENTES.sub(" ", str(author or "")).split())
 
 
-def _vaelg_sagsbehandler(
-    author: str | None,
+def _slaa_navn_op(
+    navn_raa: str | None,
     sagsbehandlere: list[dict],
-    ppr_case_id: str,
-) -> int:
-    """The Sagsbehandler id for a row's Author. Raises when it cannot be told.
+) -> tuple[int | None, str]:
+    """Look one name up in the Sagsbehandler table.
+
+    Returns (id, "") on a single confident match, or (None, reason) when it
+    cannot be told. A reason rather than an exception, so the caller can try
+    the next name before giving up.
 
     Matched on the folded name — case, spacing and accents ignored, and æ/ø/å
     flattened — because the two systems do not spell staff names identically
@@ -694,27 +697,18 @@ def _vaelg_sagsbehandler(
       1. the whole name equals the label
       2. the label is one or more whole words at the START of the name —
          "Sofie" matches "Sofie Hansen", because the table has historically
-         held first names while Author holds the full one
+         held first names while the source holds the full one
       3. the label appears as whole words anywhere in the name
 
     A pass that finds EXACTLY ONE label wins. Two labels matching equally well
     is not a tie to break: "Anne" and "Anne Marie" are different people, and
     guessing between them puts a case on the wrong caseworker's list.
-
-    BusinessError rather than a fallback owner. The case goes to pending_user
-    with the name quoted, so it is fixed by adding the person to the
-    Sagsbehandler table or correcting the row — both of which are right, where
-    silently parking it on a stand-in is not.
     """
 
-    navn = _navn_fold(_forfatter_navn(author))
+    navn = _navn_fold(_forfatter_navn(navn_raa))
 
     if not navn:
-        raise BusinessError(
-            f"PPR case {ppr_case_id}: BefordringsData has no Author on the "
-            "row, so the bevilling has no caseworker to be assigned to. "
-            "Needs manual follow-up."
-        )
+        return None, "feltet er tomt"
 
     kandidater = [
         (s, _navn_fold(s.get("label")))
@@ -745,22 +739,62 @@ def _vaelg_sagsbehandler(
         traf = [s for s, label in kandidater if label and test(label)]
 
         if len(traf) == 1:
-            return traf[0]["id"]
+            return traf[0]["id"], ""
 
         if len(traf) > 1:
-            raise BusinessError(
-                f"PPR case {ppr_case_id}: Author "
-                f"{_forfatter_navn(author)!r} matches several sagsbehandlere "
-                f"({', '.join(sorted(str(s.get('label')) for s in traf))}). "
-                "Cannot tell which one, and guessing would put the case on "
-                "the wrong caseworker's list. Needs manual follow-up."
-            )
+            navne = ", ".join(sorted(str(s.get("label")) for s in traf))
+            return None, f"passer på flere sagsbehandlere ({navne})"
+
+    return None, "findes ikke i Sagsbehandler-tabellen"
+
+
+def _vaelg_sagsbehandler(
+    author: str | None,
+    editor: str | None,
+    sagsbehandlere: list[dict],
+    ppr_case_id: str,
+) -> int:
+    """The Sagsbehandler id for a row, from its Author or failing that Editor.
+
+    Author first: it is who wrote the row, and therefore the closest thing
+    the source has to "whose case is this". Where Author cannot be resolved —
+    blank, unknown, or ambiguous — Editor is tried, because someone who edited
+    the row is a better owner than nobody.
+
+    Both are of the form "Anne Sørensen (BU Befordring)"; the bracketed part
+    is an organisational label, not part of the name, and is dropped.
+
+    BusinessError when neither resolves, naming both and why each failed. The
+    case goes to pending_user, which is fixed by adding the person to the
+    Sagsbehandler table or correcting the row — both right, where silently
+    parking it on a stand-in is not.
+    """
+
+    sagsbehandler_id, author_grund = _slaa_navn_op(author, sagsbehandlere)
+
+    if sagsbehandler_id is not None:
+        return sagsbehandler_id
+
+    sagsbehandler_id, editor_grund = _slaa_navn_op(editor, sagsbehandlere)
+
+    if sagsbehandler_id is not None:
+        logger.warning(
+            "  PPR case %s: Author %r kunne ikke bruges (%s) — sagsbehandler "
+            "sat ud fra Editor %r i stedet.\n",
+            ppr_case_id,
+            _forfatter_navn(author) or "(tom)",
+            author_grund,
+            _forfatter_navn(editor),
+        )
+
+        return sagsbehandler_id
 
     raise BusinessError(
-        f"PPR case {ppr_case_id}: Author {_forfatter_navn(author)!r} is not "
-        "in the Sagsbehandler table, so the bevilling has no caseworker. "
-        "Add the person to that table, or correct the row. Needs manual "
-        "follow-up."
+        f"PPR case {ppr_case_id}: neither Author nor Editor gives a "
+        f"caseworker. Author {_forfatter_navn(author) or '(tom)'!r}: "
+        f"{author_grund}. Editor {_forfatter_navn(editor) or '(tom)'!r}: "
+        f"{editor_grund}. Add the person to the Sagsbehandler table, or "
+        "correct the row. Needs manual follow-up."
     )
 
 
@@ -1462,7 +1496,10 @@ def create_bevilling(
             # run: the column is bevilling-level, and two bevillinger on one
             # case can have been written by different people.
             "sagsbehandler_id": _vaelg_sagsbehandler(
-                bevilling.get("Author"), sagsbehandlere, ppr_case_id
+                bevilling.get("Author"),
+                bevilling.get("Editor"),
+                sagsbehandlere,
+                ppr_case_id,
             ),
             # The PPR case id. There is no separate ESDH case to resolve —
             # the borgersag flow this bot once had was scrapped, so the source
