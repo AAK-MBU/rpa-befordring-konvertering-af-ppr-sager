@@ -557,8 +557,8 @@ _FORFATTER_PARENTES = re.compile(r"\s*[(\[][^)\]]*[)\]]\s*")
 # Values must match Rutetype.rutetype_tekst — note "Skole til hjem", not
 # "Fra skole til hjem".
 _RUTETYPE_FROM_TIDSPUNKT_RAW: dict[str, str] = {
-    "Morgen": "Hjem til skole",
-    "Eftermiddag": "Skole til hjem",
+    "Morgen": "Til skole",
+    "Eftermiddag": "Til hjem",
     "Morgen og eftermiddag": "Mellem hjem og skole",
 }
 
