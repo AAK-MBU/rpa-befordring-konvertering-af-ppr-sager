@@ -1791,6 +1791,73 @@ def _open_address_cache():
         return None, None
 
 
+def _udfyld_manglende_adresser(rows: list[dict]) -> dict[str, str]:
+    """Fill a missing ElevensAdresse from config.ADRESSE_UDFYLDNINGER.
+
+    Applied to the raw rows before anything else reads them, so the address
+    resolution, havde_kildeadresse and the borrowing pass all see one
+    consistent picture — a row that has been filled in HAS a source address,
+    and must not then borrow one from a sibling.
+
+    Only where the field is NULL or blank. A row that states an address keeps
+    it even when it cannot be resolved: that is data to correct at the source,
+    and overwriting it here would hide the error rather than show it.
+
+    Returns {ppr_case_id: address} for the cases actually touched, so the
+    kørselsrækker can be told where their address came from.
+    """
+
+    udfyldninger = getattr(config, "ADRESSE_UDFYLDNINGER", None) or {}
+
+    if not udfyldninger:
+        return {}
+
+    brugt: dict[str, str] = {}
+
+    for row in rows:
+        sag = str(row.get("CaseID") or "").strip()
+        adresse = udfyldninger.get(sag)
+
+        if not adresse or str(row.get("ElevensAdresse") or "").strip():
+            continue
+
+        row["ElevensAdresse"] = adresse
+        brugt[sag] = adresse
+
+    for sag, adresse in sorted(brugt.items()):
+        logger.warning(
+            "Sag %s: ElevensAdresse manglede på en eller flere rækker og er "
+            "udfyldt manuelt med %r fra ADRESSE_UDFYLDNINGER. "
+            "Kørselsrækkerne får en kommentar om det.\n",
+            sag,
+            adresse,
+        )
+
+    ubrugte = sorted(set(udfyldninger) - set(brugt))
+
+    if ubrugte:
+        logger.warning(
+            "%d post(er) i ADRESSE_UDFYLDNINGER blev ikke brugt — sagen er "
+            "ikke med i kørslen, eller rækkerne har fået en adresse ved "
+            "kilden i mellemtiden. Ryd dem ud: %s\n",
+            len(ubrugte),
+            ", ".join(ubrugte),
+        )
+
+    return brugt
+
+
+def _udfyldt_adresse_note(adresse: str) -> str:
+    """The comment for a bevilling whose address was filled in by hand."""
+
+    return _konverterings_note(
+        "adresse udfyldt manuelt",
+        "De gamle data havde ingen adresse på rækken.",
+        f"Adressen er sat manuelt ved konverteringen til: {adresse}",
+        "Kontrollér at den er rigtig — den står ikke i kildedata.",
+    )
+
+
 def _resolve_adresse_ids(
     rows: list[dict],
 ) -> tuple[dict[tuple[str, ...], str], dict[str, str], dict[tuple[str, ...], str]]:
@@ -2667,6 +2734,8 @@ def retrieve_items_for_queue() -> list[dict]:
 
     logger.info("Fetched %d row(s) from BefordringsData.\n", len(rows))
 
+    udfyldte_adresser = _udfyld_manglende_adresser(rows)
+
     # --- Resolve every distinct address up front ---
     adresse_ids, adresse_tekster, adresse_noter = _resolve_adresse_ids(rows)
 
@@ -2790,6 +2859,7 @@ def retrieve_items_for_queue() -> list[dict]:
 
     for ppr_case_id, case_iter in groupby(rows, key=lambda r: r["CaseID"]):
         case_rows = list(case_iter)
+        udfyldt_adresse = udfyldte_adresser.get(str(ppr_case_id).strip())
         person_ssn = case_rows[0].get("CPR", "")
 
         # Within each case, rows are bucketed by when they apply — see
@@ -2939,6 +3009,15 @@ def retrieve_items_for_queue() -> list[dict]:
                 koersel["Kommentar"] = _extend_kommentar(
                     koersel.get("Kommentar"), lukket_note
                 )
+
+                # The address was not in the source at all — see
+                # _udfyld_manglende_adresser. Said on every kørselsrække of
+                # the case, because none of them can show where it came from.
+                if udfyldt_adresse:
+                    koersel["Kommentar"] = _extend_kommentar(
+                        koersel.get("Kommentar"),
+                        _udfyldt_adresse_note(udfyldt_adresse),
+                    )
 
                 koerselsraekker.append(koersel)
 

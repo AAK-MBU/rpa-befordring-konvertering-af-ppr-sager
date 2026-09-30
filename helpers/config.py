@@ -117,3 +117,28 @@ UNRESOLVED_ADDRESS_CSV = "uloeste_adresser.csv"
 #
 # Both are written; set either to None to switch that one off.
 UNRESOLVED_ADDRESS_XLSX = "uloeste_adresser.xlsx"
+
+# ----------------------
+# Manglende ElevensAdresse — manuelle udfyldninger
+#
+# PPR-sags-ID -> den adresse rækkerne skulle have haft.
+#
+# Bruges KUN hvor ElevensAdresse er NULL eller tom. En række der HAR en
+# adresse røres ikke, heller ikke hvis adressen er forkert eller ikke kan slås
+# op: det er data der skal rettes ved kilden, og at overskrive dem her ville
+# skjule fejlen i stedet for at vise den.
+#
+# Findes til de sager hvor BefordringsData mangler adressen, og konverteringen
+# ikke kan vente på at kilden bliver rettet. Sagsbehandleren har fundet den
+# rigtige adresse i stedet.
+#
+# Adressen skrives som den står i adresseregistret — "Vej 12, 1. th, 8000
+# Aarhus C". Den slås op på helt samme måde som alle andre adresser, så en
+# stavefejl her giver en uløst adresse, ikke en forkert bevilling.
+#
+# Hver kørselsrække på sagen får en KONVERTERING-PPR-kommentar om det, så
+# sagsbehandleren kan se hvor adressen kom fra.
+# ----------------------
+ADRESSE_UDFYLDNINGER: dict[str, str] = {
+    # "PPR-2026-123456": "Vej 12, 1. th, 8000 Aarhus C",
+}
