@@ -160,3 +160,15 @@ cython_debug/
 #.idea/
 
 .vscode/*
+
+# Local cache of resolved addresses — a run artefact, not source
+resolved_addresses.csv
+Lukkede foranstaltningsmapper.csv
+
+# Per-run worklist of addresses that would not resolve
+uloeste_adresser.csv
+uloeste_adresser.xlsx
+
+# Output from helpers/tjek_elever.py
+elevtjek.csv
+elevtjek.xlsx

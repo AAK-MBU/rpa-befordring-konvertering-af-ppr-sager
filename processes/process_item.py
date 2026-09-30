@@ -21,7 +21,21 @@ def process_item(item_data: dict, item_reference: str):
                                        bevilling-level fields
                                        adresse_id (str | None), resolved at
                                          queue time against the Adresse table
+                                       adresse_id_kandidater (list[str]), every
+                                         distinct address the bucket's rows
+                                         resolved to, in row order.
+                                         bevilling_creation picks the one
+                                         matching the student's own address;
+                                         adresse_id is the fallback and what
+                                         the check below tests.
                                        koerselsraekker (list[dict])
+        lois_person  (dict | None) -- What LOIS.CPR.PersonGeoView holds for
+                                     this CPR: adresse_id, adresseringsnavn,
+                                     navne_adresse_beskyttelse. Only used when
+                                     the student is missing from Elev, which
+                                     happens for a student outside the
+                                     folkeskole — the nightly load covers
+                                     folkeskole pupils only.
     """
 
     ppr_case_id = item_data.get("ppr_case_id", "")
@@ -60,6 +74,6 @@ def process_item(item_data: dict, item_reference: str):
     bevilling_creation.create_bevilling(
         ppr_case_id=ppr_case_id,
         person_ssn=person_ssn,
-        bor_case_id=ppr_case_id,
         bevillinger=bevillinger,
+        lois_person=item_data.get("lois_person"),
     )
